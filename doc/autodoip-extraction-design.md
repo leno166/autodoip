@@ -34,10 +34,10 @@ ProtocolError                 ← 协议异常
 ```
                    ┌──────────────────┐
       ECU 0x1301 ──┤                  │
-      (198.18.44.49)│                  │
+      (192.168.10.10)│                  │
                     │     Tester       │
       ECU 0x1302 ──┤     监听         │
-      (198.18.44.50)│   ip:port      │
+      (192.168.10.20)│   ip:port      │
                     │                  │
       ECU 0x1303 ──┤                  │
                     └──────────────────┘
@@ -291,10 +291,10 @@ __all__ = ["Endpoint", "Config", "ProtocolError"]
 from autodoip import Endpoint
 
 endpoint = Endpoint(
-    ip='198.18.44.1',
+    ip='192.168.10.1',
     ecus={
-        0x1301: ('198.18.44.49', 0),  # port=0，忽略端口校验
-        0x1302: ('198.18.44.50', 13400),  # 精确匹配 IP + port
+        0x1301: ('192.168.10.10', 0),  # port=0，忽略端口校验
+        0x1302: ('192.168.10.20', 13400),  # 精确匹配 IP + port
     },
 )
 
@@ -302,14 +302,14 @@ endpoint.start()
 
 # 查看连接状态
 print(endpoint.connections())
-# {0x1301: ('198.18.44.49', 0, True), 0x1302: ('198.18.44.50', 13400, False)}
+# {0x1301: ('192.168.10.10', 0, True), 0x1302: ('192.168.10.20', 13400, False)}
 
 # 切换到已连接的 ECU
 ok = endpoint.select(0x1301)  # → True（已连接，切换成功）
 ok = endpoint.select(0x1302)  # → False（未连接，保持当前不变）
 
 # 发送诊断请求
-response = endpoint.send(bytes.fromhex('22DC06'))
+response = endpoint.send(bytes.fromhex('22FF00'))
 
 endpoint.stop()
 ```

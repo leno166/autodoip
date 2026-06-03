@@ -13,12 +13,12 @@ pip install autodoip
 ```python
 from autodoip import Endpoint
 
-# 创建端点 — 监听 198.18.44.1:13400，等待 ECU 连接
+# 创建端点 — 监听 192.168.10.1:13400，等待 ECU 连接
 endpoint = Endpoint(
-    ip='198.18.44.1',
+    ip='192.168.10.1',
     ecus={
-        0x1301: ('198.18.44.49', 0),     # port=0 忽略端口校验
-        0x1302: ('198.18.44.50', 13400), # 精确匹配 IP + port
+        0x1301: ('192.168.10.10', 0),     # port=0 忽略端口校验
+        0x1302: ('192.168.10.20', 13400), # 精确匹配 IP + port
     },
 )
 
@@ -26,11 +26,11 @@ endpoint.start()
 
 # 查看连接状态
 print(endpoint.connections())
-# {0x1301: ('198.18.44.49', 0, True), 0x1302: ('198.18.44.50', 13400, False)}
+# {0x1301: ('192.168.10.10', 0, True), 0x1302: ('192.168.10.20', 13400, False)}
 
 # 切换到已连接的 ECU，发送诊断请求
 endpoint.select(0x1301)
-response = endpoint.send(bytes.fromhex('22DC06'))
+response = endpoint.send(bytes.fromhex('22FF00'))
 print(response.hex(' '))
 
 endpoint.stop()
