@@ -53,15 +53,15 @@ class _Protocol:
 
     def encode(self, payload: bytes, tester: int, ecu: int) -> bytes:
         inner = (
-            tester.to_bytes(2, self._byte_order) +
-            ecu.to_bytes(2, self._byte_order) +
-            payload
+                tester.to_bytes(2, self._byte_order) +
+                ecu.to_bytes(2, self._byte_order) +
+                payload
         )
         header = (
-            self._version.to_bytes(1, self._byte_order) +
-            (~self._version & 0xFF).to_bytes(1, self._byte_order) +
-            self._msg_type.to_bytes(2, self._byte_order) +
-            len(inner).to_bytes(4, self._byte_order)
+                self._version.to_bytes(1, self._byte_order) +
+                (~self._version & 0xFF).to_bytes(1, self._byte_order) +
+                self._msg_type.to_bytes(2, self._byte_order) +
+                len(inner).to_bytes(4, self._byte_order)
         )
         return header + inner
 
@@ -128,7 +128,7 @@ class Endpoint:
                  port: int = 13400,
                  tester: int = 0x0E80,
                  config: Optional[Config] = None):
-        cfg = config or Config()
+        self._config = config or Config()
 
         # 身份参数
         self._ip = ip
@@ -136,14 +136,10 @@ class Endpoint:
         self._tester = tester
         self._ecus: dict[int, tuple[str, int]] = ecus.copy()
 
-        # 传输调优
-        self._accept_timeout = cfg.accept_timeout
-        self._recv_timeout = cfg.recv_timeout
-        self._reconnect_timeout = cfg.reconnect_timeout
-        self._listen_count = cfg.listen_count
-
         # 协议
-        self._protocol = _Protocol(cfg.version, cfg.msg_type, cfg.byte_order)
+        self._protocol = _Protocol(self._config.version,
+                                   self._config.msg_type,
+                                   self._config.byte_order)
 
         # 连接表 — 预建，sock 初始 None
         self._socks: dict[int, Optional[_Sock]] = {
@@ -161,13 +157,13 @@ class Endpoint:
         """启动 DoIP 监听，accept 等待 ECU 连接。"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.settimeout(self._accept_timeout)
+        sock.settimeout(self._config.accept_timeout)
         sock.bind((self._ip, self._port))
-        sock.listen(self._listen_count)
+        sock.listen(self._config.listen_count)
         self._server = sock
         logger.info("DoIP 服务启动，监听 %s:%d，backlog %d",
-                    self._ip, self._port, self._listen_count)
-        self._accept_once()
+                    self._ip, self._port, self._config.listen_count)
+        self._accept_once_cycle()
 
     def stop(self) -> None:
         """关闭所有连接和 server socket。"""
@@ -177,8 +173,7 @@ class Endpoint:
                     s.close()
                     logger.debug("关闭 ECU 0x%04X 的 socket", addr)
                 except Exception as e:
-                    logger.error("关闭 ECU 0x%04X 的 socket 时出错: %s",
-                                 addr, e, exc_info=True)
+                    logger.error("关闭 ECU 0x%04X 的 socket 时出错: %s", addr, e, exc_info=True)
         self._socks = {addr: None for addr in self._ecus}
 
         if self._server:
@@ -254,7 +249,7 @@ class Endpoint:
 
     # --- 内部 ---
 
-    def _accept_once(self) -> None:
+    def _accept_once_cycle(self) -> None:
         """单次 accept 循环，获取初始连接。
         按 ecus 表匹配 IP：匹配成功填入 sock，不在表中则 warn + close。
         """
@@ -271,7 +266,7 @@ class Endpoint:
                 break
 
             src_ip, src_port = addr
-            sock.settimeout(self._recv_timeout)
+            sock.settimeout(self._config.recv_timeout)
 
             # 在 ecus 表中查找匹配的 ECU
             matched = next(
@@ -281,8 +276,7 @@ class Endpoint:
             )
 
             if matched is None:
-                logger.warning("收到非预期连接 %s:%d，不在 ECU 表中，已关闭",
-                               src_ip, src_port)
+                logger.warning("收到非预期连接 %s:%d，不在 ECU 表中，已关闭", src_ip, src_port)
                 sock.close()
                 continue
 
@@ -304,11 +298,11 @@ class Endpoint:
             old.close()
         self._socks[addr] = None
 
-        self._server.settimeout(self._reconnect_timeout)
+        self._server.settimeout(self._config.reconnect_timeout)
         try:
             sock, recv_addr = self._server.accept()
         finally:
-            self._server.settimeout(self._accept_timeout)
+            self._server.settimeout(self._config.accept_timeout)
 
         src_ip, src_port = recv_addr
 
@@ -330,7 +324,7 @@ class Endpoint:
                 f"实际收到 {src_ip}:{src_port} 匹配 0x{matched:04X}"
             )
 
-        sock.settimeout(self._recv_timeout)
+        sock.settimeout(self._config.recv_timeout)
         new_sock = _Sock(sock)
         self._socks[addr] = new_sock
         logger.info("ECU 0x%04X 重连成功", addr)

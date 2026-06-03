@@ -15,7 +15,7 @@ class Config:
     accept_timeout: float = 1.5
     recv_timeout: float = 3.0
     reconnect_timeout: float = 5.0
-    listen_count: int = 10
+    listen_count: int = 5
     version: int = 0x02
     msg_type: int = 0x8001
     byte_order: Literal['little', 'big'] = 'big'

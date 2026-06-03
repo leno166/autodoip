@@ -1,89 +1,29 @@
-# autodoip 解耦设计方案
+# autodoip 设计文档
 
-> 将 `terminal` 项目中的 DoIP 传输层从 Diag 库中剥离，使其成为独立的 Python 包 `autodoip`。
-
----
-
-## 1. 现状分析
-
-### 1.1 Diag 库文件结构
-
-```
-terminal/src/workspace/module/Diag/
-├── __init__.py       # 导出 Session, Service, UdsResponse + Config
-├── __main__.py       # 使用演示
-├── doip.py           # DoIP 层: Sock → SocketManager → Protocol → DoIPEndpoint
-├── uds.py            # UDS 层:  KeepAlive + Session
-├── service.py        # 配置 dataclass + Service 业务层
-├── helper.py         # 工具:   recv_exact, recv_frame, to_bytes
-├── response.py       # UdsResponse 数据类
-└── errors.py         # DoIpProtocolError
-```
-
-### 1.2 分层架构
-
-```
-Service (service.py)         ← UDS 标准方法（会话/安全/读写/例程）
-Session (uds.py)             ← 持有 Endpoint + KeepAlive，ECU 路由
-KeepAlive (uds.py)           ← 后台 TesterPresent 心跳线程
-──────────────────────────────────────────
-Endpoint (autodoip)          ← SocketManager + Protocol + Lock + 自动重连
-Protocol (autodoip)          ← DoIP 帧编解码（ISO 13400）
-SocketManager (autodoip)     ← Socket 生命周期 + 连接表 + 重连
-Sock (autodoip)              ← 单 socket 封装
-recv_frame                   ← 帧级 IO 收取
-ProtocolError                ← 协议异常
-──────────────────────────────────────────
-UdsResponse (response.py)    ← 正/负响应解析 + NRC 描述
-helper.to_bytes              ← 通用类型→bytes 转换
-```
-
-**分割线上下就是 DoIP 和 UDS 的天然边界。**
-
-### 1.3 依赖关系图
-
-```
-                                 ┌──────────────┐
-                                 │  stdlib only │
-                                 └──────┬───────┘
-                          ┌─────────────┼─────────────┐
-                          │             │             │
-                    errors.py      helper.py     helper.py
-                  (ProtocolError  (recv_exact,   (to_bytes)
-                      )            recv_frame)       │
-                          │             │             │
-                          └──────┬──────┘             │
-                                 │                    │
-                              doip.py                  │
-                     (_Sock, _SocketManager,           │
-                      _Protocol, Endpoint)             │
-                                 │                    │
-                          ┌──────┴──────┐             │
-                          │             │             │
-                        uds.py     service.py         │
-                     (KeepAlive,  (Config,            │
-                       Session)    KeepAliveConfig,   │
-                                   RetryConfig,       │
-                                   Service)           │
-                          │             │             │
-                          └──────┬──────┘             │
-                                 │                    │
-                           response.py ───────────────┘
-                          (UdsResponse)
-```
+> DoIP (Diagnostics over IP) transport layer for automotive UDS — ISO 13400.
 
 ---
 
-## 2. 解耦方案
-
-### 2.1 提取原则
+## 1. 设计原则
 
 | 原则 | 说明 |
 |------|------|
-| DoIP 不感知 UDS | `autodoip` 只负责传输层：连接管理、帧编解码、收发。参数名用 `payload` 而非 `uds` |
+| DoIP 不感知 UDS | 只负责传输层：连接管理、帧编解码、收发。参数名用 `payload` 而非 `uds` |
 | 零外部依赖 | 仅 Python 标准库 `socket` + `threading` + `dataclasses` |
 | 最小公开 API | 只暴露 `Endpoint` / `Config` / `ProtocolError`，内部实现随时可改 |
-| 库名即前缀 | 类名去掉 `DoIP`/`DoIp`，`from autodoip import Endpoint` 语义已足够 |
+| 库名即前缀 | 类名无 `DoIP`/`DoIp` 前缀，`from autodoip import Endpoint` 语义已足够 |
+
+### 1.1 分层边界
+
+```
+上层（UDS / Session）           ← 不在本库范围内
+──────────────────────────
+Endpoint                      ← Socket + 连接表 + Protocol + Lock + 自动重连
+_Protocol                     ← DoIP 帧编解码（ISO 13400）
+_Sock                         ← 单 socket 封装
+recv_frame / to_bytes         ← IO + 类型转换
+ProtocolError                 ← 协议异常
+```
 
 ### 2.2 连接拓扑：Tester-as-Server
 
@@ -138,20 +78,17 @@ src/autodoip/
 └── _util.py            # to_bytes — 类型→bytes 转换（内部）
 ```
 
-### 2.4 命名对照
+### 2.4 命名与可见性
 
-```
-现名（terminal 旧）          改名（autodoip 新）           可见性
-────────────────────────     ──────────────────────       ──────
-DoIPEndpoint          →      Endpoint                     公开
-DoIPConfig            →      Config                       公开
-DoIpProtocolError     →      ProtocolError                公开
-Protocol              →      _Protocol                    内部
-SocketManager         →      _SocketManager               内部
-Sock                  →      _Sock                        内部
-recv_exact            →      recv_exact                   内部
-recv_frame            →      recv_frame                   内部
-```
+| 类/函数 | 可见性 | 说明 |
+|---------|--------|------|
+| `Endpoint` | 公开 | DoIP 端点入口 |
+| `Config` | 公开 | 传输调优参数 |
+| `ProtocolError` | 公开 | 协议异常 |
+| `_Sock` | 内部 | 单 socket 封装 |
+| `_Protocol` | 内部 | DoIP 帧编解码 |
+| `recv_exact` | 内部 | 精确收取 |
+| `recv_frame` | 内部 | 完整帧收取 |
 
 ### 2.5 各模块内容
 
@@ -162,17 +99,17 @@ recv_frame            →      recv_frame                   内部
 | `recv_exact(sock, size) -> bytes` | 精确收取 size 字节，连接关闭时抛 `ConnectionError` |
 | `recv_frame(sock) -> bytes` | 收取完整 DoIP 帧（8 字节头 + N 字节载荷） |
 
-从 `helper.py` 原样移入，无修改。
+仅依赖 `socket` 标准库。
 
 #### `_util.py` — 类型转换
 
 ```python
 def to_bytes(value, byte_order: Literal['little', 'big']) -> bytes:
     """统一类型 → bytes。支持 bytes/bytearray/str/int/None。
-    byte_order 不设默认值，由调用方显式传入（来自 Config.byte_order）。"""
+    byte_order 不设默认值，由调用方显式传入。"""
 ```
 
-从 `helper.py` 复制一份，去掉 `byte_order` 的默认值。autodoip 内部使用（后续主动连接模式需要 hex 请求转换），也让 autodoip 完全自给自足。terminal 侧保留原有的不动。
+供 autodoip 内部及上层使用（hex 请求转换等）。
 
 #### `_config.py` — 传输调优参数
 
@@ -189,20 +126,16 @@ class Config:
     byte_order: Literal['little', 'big'] = 'big'
 ```
 
-从 `service.py` 移入，去掉 `DoIP` 前缀，移除 `port` 和 `tester`（这两个是 Endpoint 的身份参数，在 Endpoint 签名中直接声明默认值）。原 `service.py` 改为 `from autodoip import Config as DoIPConfig`。
-
 #### `_errors.py` — 异常
 
 ```python
 class ProtocolError(Exception):
-    """DoIP 协议层错误"""
+    """DoIP 协议层错误 — 帧格式校验失败"""
 ```
-
-从 `errors.py` 移入，`DoIpProtocolError` → `ProtocolError`。
 
 #### `_transport.py` — 传输层
 
-从 `doip.py` 移入，含 4 个类。核心变化：
+含 4 个类：`_Sock` + `_Protocol` + `Endpoint`（整合了原 SocketManager）。
 
 **1. Endpoint 构造函数**
 
@@ -340,131 +273,22 @@ __all__ = ["Endpoint", "Config", "ProtocolError"]
 
 ### 2.6 关键设计决策
 
-#### 决策 A：`Config` 归 autodoip 还是 terminal？
-
-**归 autodoip。** 理由：
-- 8 个字段全部是 DoIP 传输参数
-- `terminal` 中 `Session.__init__` 将其解包后传入 `Endpoint` 构造器——Session 只是透传
-- 移入 `autodoip` 后，用户可以 `from autodoip import Config` 直接用，无需装 terminal
-
-#### 决策 B：`helper.py` 怎么拆？
-
-| 函数 | 归属 | 理由 |
-|------|------|------|
-| `recv_exact` | → `autodoip._frame` | DoIP 帧收取需要 |
-| `recv_frame` | → `autodoip._frame` | DoIP 帧收取需要 |
-| `to_bytes` | 复制到 `autodoip._util`，同时保留在 `terminal` | autodoip 自给自足，不依赖 terminal 的工具函数 |
-
-#### 决策 C：`KeepAlive` 是否随 DoIP 走？
-
-**不留。** `KeepAlive` 用的是 UDS TesterPresent（0x3E 00），属于 UDS 层概念。它的构造函数接收 `fn: Callable[[bytes], bytes]`，已经与 Endpoint 解耦——不需要知道传输细节。
-
-#### 决策 D：为什么只公开 3 个 API？
+#### 为什么只公开 3 个 API？
 
 | 类 | 能否被外部直接使用？ | 决策 |
 |----|-------------------|------|
-| `Endpoint` | Session 创建它、用户也能直接用 | **公开** |
-| `Config` | Session 解包配置、用户创建配置 | **公开** |
-| `ProtocolError` | Endpoint 抛出、用户需要 catch | **公开** |
+| `Endpoint` | 用户直接使用 | **公开** |
+| `Config` | 用户创建配置 | **公开** |
+| `ProtocolError` | 用户需要 catch | **公开** |
 | `_Protocol` | 只被 Endpoint 内部使用 | **内部** |
-| `_SocketManager` | 只被 Endpoint 内部使用 | **内部** |
-| `_Sock` | 只被 _SocketManager 内部使用 | **内部** |
+| `_Sock` | 只被 Endpoint 内部使用 | **内部** |
 
-用户不会绕过 `Endpoint` 直接操作 socket 表或手拼 DoIP 帧。日后如果要支持"主动连接"模式（tester-as-client），也只需改 `_transport.py` 内部实现，公开 API 不变。
+用户不需要绕过 `Endpoint` 直接操作 socket 或手拼 DoIP 帧。后续支持"主动连接"模式也只需改内部实现，公开 API 不变。
 
-### 2.7 terminal 改动清单
+### 2.7 后续演进
 
-| 文件 | 改动 | 说明 |
-|------|------|------|
-| `doip.py` | **删除** | ~297 行移入 autodoip |
-| `helper.py` | 删除 `recv_exact`、`recv_frame`，保留 `to_bytes` | 删 ~28 行 |
-| `errors.py` | 删除 `DoIpProtocolError` | 删 2 行 |
-| `service.py` | 删除 `DoIPConfig` dataclass，改为 `from autodoip import Config as DoIPConfig` | Config 字段减少（port/tester 已移除） |
-| `uds.py` | Session 适配新的 Endpoint 接口 | 主要改动点（见下） |
-| `__init__.py` | 可选 re-export 保持兼容 | 改 1 行 |
-| 新增 `pyproject.toml` | 添加 `autodoip` 依赖 | 新增 |
-
-**Session 适配要点：**
-
-```python
-# 旧：Session 持有 ip/port/tester，构造 DoIPEndpoint 时逐参数传入
-# 旧：ecus 格式 {name: (ip, logical_addr)}
-# 新：
-class Session:
-    def __init__(self, ip, ecus, config=None, keepalive=None):
-        # ecus 仍是 {name: (ip, logical_addr)}，Session 内部转换格式传给 Endpoint
-        autodoip_ecus = {addr: (ip, 0) for name, (ip, addr) in ecus.items()}
-        self._endpoint = Endpoint(ip=ip, ecus=autodoip_ecus, config=config)
-        # Session 额外维护 name → addr 映射用于 on(name) 方法
-
-    def on(self, name: str) -> Self:
-        ip, addr = self._ecus[name]
-        self._endpoint.select(addr)   # 只传逻辑地址，Endpoint 内部查表
-        ...
-```
-
----
-
-## 3. 包配置
-
-### 3.1 pyproject.toml
-
-```toml
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[project]
-name = "autodoip"
-version = "0.1.0"
-description = "DoIP (Diagnostics over IP) transport layer for automotive UDS communication — ISO 13400"
-readme = "README.md"
-requires-python = ">=3.10"
-license = {text = "MIT"}
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
-    "Topic :: System :: Networking",
-]
-dependencies = []
-
-[project.urls]
-Homepage = "https://github.com/leno166/autodoip"
-```
-
-### 3.2 terminal 新增依赖
-
-```toml
-# terminal/pyproject.toml
-dependencies = [
-    "autodoip>=0.1.0",
-]
-```
-
----
-
-## 4. 迁移路线
-
-### Phase 1：创建 autodoip 包（本次）
-
-1. 将 `doip.py` / `helper.recv_*` / `errors.py` / `DoIPConfig` 移入 `autodoip/src/autodoip/`
-2. 按命名对照表改名、调整 import、去前缀
-3. `__init__.py` 只暴露 3 个 API
-4. 本地 `pip install -e .` 验证可导入
-5. 发布到 PyPI（先 test.pypi.org）
-
-### Phase 2：terminal 适配
-
-1. `terminal` 添加 `autodoip` 依赖
-2. 删除已迁移的代码，改为 import
-3. 运行现有诊断流程验证功能正常
-
-### Phase 3：后续演进
-
-1. 添加"主动连接"模式（tester connect 到 ECU，先连接后监听）
+1. 添加"主动连接"模式（tester connect 到 ECU）
 2. 自动降级：先主动连，失败后 fallback 到被动监听
-3. API 文档 + CI 自动发布
 
 ---
 
