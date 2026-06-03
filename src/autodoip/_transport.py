@@ -23,14 +23,16 @@ logger = getLogger(__name__)
 class _Sock:
     """单个 socket 封装，send/recv/close"""
 
-    def __init__(self, sock: socket.socket):
+    def __init__(self, sock: socket.socket,
+                 byte_order: Literal['little', 'big'] = 'big'):
         self._sock = sock
+        self._byte_order: Literal['little', 'big'] = byte_order
 
     def send(self, msg: bytes) -> None:
         self._sock.sendall(msg)
 
     def recv(self) -> bytes:
-        return recv_frame(self._sock)
+        return recv_frame(self._sock, self._byte_order)
 
     def close(self) -> None:
         self._sock.close()
@@ -154,8 +156,10 @@ class Endpoint:
     # --- 生命周期 ---
 
     def start(self) -> None:
-        """启动 DoIP 监听，accept 等待 ECU 连接。"""
+        """启动 DoIP 监听，accept 等待 ECU 连接。幂等，重复调用无副作用。"""
         with self._lock:
+            if self._server is not None:
+                return
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.settimeout(self._config.accept_timeout)
@@ -210,7 +214,7 @@ class Endpoint:
             if addr not in self._ecus:
                 raise ValueError(f"未知 ECU 逻辑地址: 0x{addr:04X}")
             if self._socks[addr] is None:
-                logger.warning("ECU 0x%04X 尚未连接，保持当前选中", addr)
+                logger.warning("ECU 0x%04X 尚未连接，保持当前选中 ECU", addr)
                 return False
             self._current = addr
             return True
@@ -230,12 +234,11 @@ class Endpoint:
         """
         with self._lock:
             if self._current is None:
-                raise ProtocolError('[DoIp] 没有设置 ecu 逻辑地址')
+                raise ProtocolError('DoIP: 没有设置 ecu 逻辑地址')
 
             ecu = self._current
-            ip, _ = self._ecus[ecu]
             frame = self._protocol.encode(payload, self._tester, ecu)
-            logger.debug('TX DoIp: %s', frame.hex(' '))
+            logger.debug('TX DoIP: %s', frame.hex(' '))
 
             sock = self._socks[ecu]
 
@@ -253,7 +256,7 @@ class Endpoint:
                     logger.error('重连后仍失败，清空连接', exc_info=True)
                     raise ConnectionError(f'ECU 0x{ecu:04X} 连接断开')
 
-        logger.debug('RX DoIp: %s', response.hex(' '))
+        logger.debug('RX DoIP: %s', response.hex(' '))
         return self._protocol.decode(response, self._tester, ecu)
 
     # --- 内部 ---
@@ -286,7 +289,7 @@ class Endpoint:
             )
 
             if matched is None:
-                logger.warning("收到非预期连接 %s:%d，不在 ECU 表中，已关闭", src_ip, src_port)
+                logger.info("收到非预期连接 %s:%d，不在 ECU 表中，已关闭", src_ip, src_port)
                 sock.close()
                 continue
 
@@ -294,13 +297,13 @@ class Endpoint:
             old = self._socks[matched]
             if old is not None:
                 old.close()
-                logger.warning("ECU 0x%04X 关闭已有连接", matched)
+                logger.info("ECU 0x%04X 关闭已有连接", matched)
 
-            self._socks[matched] = _Sock(sock)
+            self._socks[matched] = _Sock(sock, self._config.byte_order)
             logger.info("ECU 已连接 0x%04X @ %s:%d", matched, src_ip, src_port)
 
     def _reconnect(self, addr: int) -> _Sock:
-        """重连指定 ECU。复用 _accept_once_cycle 循环 accept 填表，
+        """重连指定 ECU。调 _accept4connect 循环 accept 填表，
         结束后检查目标是否已连接。"""
         old = self._socks[addr]
         if old is not None:

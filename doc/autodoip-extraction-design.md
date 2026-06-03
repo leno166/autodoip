@@ -21,7 +21,7 @@
 Endpoint                      ← Socket + 连接表 + Protocol + Lock + 自动重连
 _Protocol                     ← DoIP 帧编解码（ISO 13400）
 _Sock                         ← 单 socket 封装
-recv_frame / to_bytes         ← IO + 类型转换
+recv_frame                    ← 帧级 IO
 ProtocolError                 ← 协议异常
 ```
 
@@ -72,8 +72,7 @@ src/autodoip/
 ├── _frame.py          # recv_exact + recv_frame（帧级 IO，内部）
 ├── _config.py         # Config 数据类（公开内容，模块名私有）
 ├── _errors.py         # ProtocolError（公开内容，模块名私有）
-└── _transport.py      # Endpoint（公开）+ _Protocol + _SocketManager + _Sock（内部）
-└── _util.py            # to_bytes — 类型→bytes 转换（内部）
+└── _transport.py      # Endpoint（公开）+ _Protocol + _Sock（内部）
 ```
 
 ### 2.4 命名与可见性
@@ -98,16 +97,6 @@ src/autodoip/
 | `recv_frame(sock) -> bytes`       | 收取完整 DoIP 帧（8 字节头 + N 字节载荷）           |
 
 仅依赖 `socket` 标准库。
-
-#### `_util.py` — 类型转换
-
-```python
-def to_bytes(value, byte_order: Literal['little', 'big']) -> bytes:
-    """统一类型 → bytes。支持 bytes/bytearray/str/int/None。
-    byte_order 不设默认值，由调用方显式传入。"""
-```
-
-供 autodoip 内部使用（hex 请求转换等）。
 
 #### `_config.py` — 传输调优参数
 
@@ -344,8 +333,8 @@ Endpoint 直接参数（身份/连接）        Config 参数（传输调优）
 ─────────────────────────────────    ──────────────────────
 ip: str              必传，无默认     accept_timeout: 1.5
 ecus: dict[int,(s,i)] 必传，无默认    recv_timeout:   3.0
-port: int            默认 13400       reconnect_timeout: 5.0
-tester: int          默认 0x0E80      listen_count:   10
+port: int            默认 13400       
+tester: int          默认 0x0E80      listen_count:   5
                                       version:        0x02
                                       msg_type:       0x8001
                                       byte_order:     'big'
