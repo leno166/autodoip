@@ -12,8 +12,7 @@ class TestConfig:
         c = Config()
         assert c.accept_timeout == 1.5
         assert c.recv_timeout == 3.0
-        assert c.reconnect_timeout == 5.0
-        assert c.listen_count == 10
+        assert c.listen_count == 5
         assert c.version == 0x02
         assert c.msg_type == 0x8001
         assert c.byte_order == 'big'
@@ -23,12 +22,12 @@ class TestConfig:
         assert c.recv_timeout == 5.0
         assert c.version == 0x03
         assert c.accept_timeout == 1.5       # 未覆盖保持默认
-        assert c.listen_count == 10
+        assert c.listen_count == 5
 
     def test_immutable_when_not_overridden(self):
         c1 = Config()
         c2 = Config()
-        assert c1.listen_count == c2.listen_count == 10
+        assert c1.listen_count == c2.listen_count == 5
 
 
 class TestEndpointWithConfig:
@@ -37,7 +36,7 @@ class TestEndpointWithConfig:
     def test_default_config(self):
         ep = Endpoint(ip='0.0.0.0', ecus={0x1301: ('10.0.0.1', 0)})
         assert ep._config.accept_timeout == 1.5
-        assert ep._config.listen_count == 10
+        assert ep._config.listen_count == 5
         assert ep._config.byte_order == 'big'
 
     def test_custom_config_passed(self):
@@ -54,7 +53,6 @@ class TestEndpointWithConfig:
         assert ep._config is cfg
         assert not hasattr(ep, '_accept_timeout')
         assert not hasattr(ep, '_recv_timeout')
-        assert not hasattr(ep, '_reconnect_timeout')
         assert not hasattr(ep, '_listen_count')
 
     def test_tester_in_endpoint_not_in_config(self):

@@ -6,17 +6,17 @@
 
 ## 1. 设计原则
 
-| 原则 | 说明 |
-|------|------|
-| DoIP 不感知 UDS | 只负责传输层：连接管理、帧编解码、收发。参数名用 `payload` 而非 `uds` |
-| 零外部依赖 | 仅 Python 标准库 `socket` + `threading` + `dataclasses` |
-| 最小公开 API | 只暴露 `Endpoint` / `Config` / `ProtocolError`，内部实现随时可改 |
-| 库名即前缀 | 类名无 `DoIP`/`DoIp` 前缀，`from autodoip import Endpoint` 语义已足够 |
+| 原则           | 说明                                                         |
+|--------------|------------------------------------------------------------|
+| DoIP 不感知 UDS | 只负责传输层：连接管理、帧编解码、收发。参数名用 `payload` 而非 `uds`                |
+| 零外部依赖        | 仅 Python 标准库 `socket` + `threading` + `dataclasses`        |
+| 最小公开 API     | 只暴露 `Endpoint` / `Config` / `ProtocolError`，内部实现随时可改       |
+| 库名即前缀        | 类名无 `DoIP`/`DoIp` 前缀，`from autodoip import Endpoint` 语义已足够 |
 
 ### 1.1 分层边界
 
 ```
-上层（UDS / Session）           ← 不在本库范围内
+上层（UDS）           ← 不在本库范围内
 ──────────────────────────
 Endpoint                      ← Socket + 连接表 + Protocol + Lock + 自动重连
 _Protocol                     ← DoIP 帧编解码（ISO 13400）
@@ -64,8 +64,6 @@ ProtocolError                 ← 协议异常
 
 因此一个端口 = 一个 Endpoint = 一份 Config，不存在多 Endpoint 多 Config 的场景。
 
-> Config 存储方案（单例 vs `self._config`）暂搁置，后续讨论。
-
 ### 2.4 autodoip 包结构
 
 ```
@@ -80,24 +78,24 @@ src/autodoip/
 
 ### 2.4 命名与可见性
 
-| 类/函数 | 可见性 | 说明 |
-|---------|--------|------|
-| `Endpoint` | 公开 | DoIP 端点入口 |
-| `Config` | 公开 | 传输调优参数 |
-| `ProtocolError` | 公开 | 协议异常 |
-| `_Sock` | 内部 | 单 socket 封装 |
-| `_Protocol` | 内部 | DoIP 帧编解码 |
-| `recv_exact` | 内部 | 精确收取 |
-| `recv_frame` | 内部 | 完整帧收取 |
+| 类/函数            | 可见性 | 说明          |
+|-----------------|-----|-------------|
+| `Endpoint`      | 公开  | DoIP 端点入口   |
+| `Config`        | 公开  | 传输调优参数      |
+| `ProtocolError` | 公开  | 协议异常        |
+| `_Sock`         | 内部  | 单 socket 封装 |
+| `_Protocol`     | 内部  | DoIP 帧编解码   |
+| `recv_exact`    | 内部  | 精确收取        |
+| `recv_frame`    | 内部  | 完整帧收取       |
 
 ### 2.5 各模块内容
 
 #### `_frame.py` — 帧 IO 工具
 
-| 函数 | 用途 |
-|------|------|
+| 函数                                | 用途                                    |
+|-----------------------------------|---------------------------------------|
 | `recv_exact(sock, size) -> bytes` | 精确收取 size 字节，连接关闭时抛 `ConnectionError` |
-| `recv_frame(sock) -> bytes` | 收取完整 DoIP 帧（8 字节头 + N 字节载荷） |
+| `recv_frame(sock) -> bytes`       | 收取完整 DoIP 帧（8 字节头 + N 字节载荷）           |
 
 仅依赖 `socket` 标准库。
 
@@ -109,7 +107,7 @@ def to_bytes(value, byte_order: Literal['little', 'big']) -> bytes:
     byte_order 不设默认值，由调用方显式传入。"""
 ```
 
-供 autodoip 内部及上层使用（hex 请求转换等）。
+供 autodoip 内部使用（hex 请求转换等）。
 
 #### `_config.py` — 传输调优参数
 
@@ -119,8 +117,7 @@ class Config:
     """DoIP 传输层调优参数（不含身份参数：ip/port/tester/ecus）"""
     accept_timeout: float = 1.5
     recv_timeout: float = 3.0
-    reconnect_timeout: float = 5.0
-    listen_count: int = 10
+    listen_count: int = 5
     version: int = 0x02
     msg_type: int = 0x8001
     byte_order: Literal['little', 'big'] = 'big'
@@ -142,11 +139,11 @@ class ProtocolError(Exception):
 ```python
 class Endpoint:
     def __init__(self,
-                 ip: str,                           # 本地监听 IP，必传，无默认
+                 ip: str,  # 本地监听 IP，必传，无默认
                  ecus: dict[int, tuple[str, int]],  # 逻辑地址 → (ECU_IP, ECU_port)，port=0 忽略
-                 port: int = 13400,                 # 本地监听端口
-                 tester: int = 0x0E80,              # tester 逻辑地址
-                 config: Config | None = None):     # 传输调优，可选
+                 port: int = 13400,  # 本地监听端口
+                 tester: int = 0x0E80,  # tester 逻辑地址
+                 config: Config | None = None):  # 传输调优，可选
         cfg = config or Config()
         self._ip = ip
         self._port = port
@@ -158,19 +155,18 @@ class Endpoint:
 
 **参数分类**
 
-| 类别 | 参数 | 默认值 | 归属 |
-|------|------|--------|------|
-| **身份/连接** | `ip` | 无（必传） | Endpoint 签名 |
-| | `ecus` | 无（必传） | Endpoint 签名 |
-| | `port` | 13400 | Endpoint 签名 |
-| | `tester` | 0x0E80 | Endpoint 签名 |
-| **传输调优** | `accept_timeout` | 1.5 | Config |
-| | `recv_timeout` | 3.0 | Config |
-| | `reconnect_timeout` | 5.0 | Config |
-| | `listen_count` | 10 | Config |
-| | `version` | 0x02 | Config |
-| | `msg_type` | 0x8001 | Config |
-| | `byte_order` | 'big' | Config |
+| 类别        | 参数                  | 默认值    | 归属          |
+|-----------|---------------------|--------|-------------|
+| **身份/连接** | `ip`                | 无（必传）  | Endpoint 签名 |
+|           | `ecus`              | 无（必传）  | Endpoint 签名 |
+|           | `port`              | 13400  | Endpoint 签名 |
+|           | `tester`            | 0x0E80 | Endpoint 签名 |
+| **传输调优**  | `accept_timeout`    | 1.5    | Config      |
+|           | `recv_timeout`      | 3.0    | Config      |
+|           | `listen_count`      | 5      | Config      |
+|           | `version`           | 0x02   | Config      |
+|           | `msg_type`          | 0x8001 | Config      |
+|           | `byte_order`        | 'big'  | Config      |
 
 **2. 连接表内部结构**
 
@@ -183,13 +179,11 @@ self._socks: dict[int, _Sock | None] = {addr: None for addr in ecus}
 # 0x1302 → None           ← 声明了但还没连上
 ```
 
-**3. accept 行为（`_accept_once`）**
+**3. accept 行为（`_accept4connect`）**
 
-对每个 accept 到的连接 `(sock, (src_ip, src_port))`：
-1. 遍历 `_ecus` 表，按 IP 匹配（port 校验：0 跳过，非 0 需精确匹配）
-2. **匹配成功** → `self._socks[addr] = _Sock(sock)`，连接就位
-3. **匹配失败**（不在 ecus 表中）→ `logger.warning` + 关闭该 socket，不加入路由表
-4. 声明了但未连上的 ECU 保持 `None`，**不删除、不报错**
+`start()` 启动时调一次 `_accept4connect`：`accept_timeout` 内循环 accept，匹配 ecus 填表，超时退出。
+
+之后不再自动运行——只在 `send()` 出错时被触发。
 
 **4. select 行为**
 
@@ -208,26 +202,33 @@ def select(self, addr: int) -> bool:
 - 目标 ECU 未连接 → 返回 `False`，**不切换、不抛异常、不退**
 - 上层（Session）收到 `False` 可以自己决定处理——忽略、重试、或上报给用户
 
-**5. reconnect 行为**
+**5. send 与重连**
+
+`sock.send()` 失败和 `sock` 为 None 统一经过同一个 except 处理：
 
 ```python
-def reconnect(self, timeout: float) -> None:
-    addr = self._current
-    ip, port = self._ecus[addr]
-    # accept 等待重连...
-    sock, (src_ip, src_port) = self._server.accept()
-    # 收到的 IP 必须在 ecus 表中（任意 addr 都行）
-    matched = next((a for a, (e_ip, e_port) in self._ecus.items()
-                    if e_ip == src_ip and (e_port == 0 or e_port == src_port)), None)
-    if matched is None:
-        sock.close()
-        raise ConnectionError(f"重连收到非预期 IP: {src_ip}，不在 ECU 表中")
-    # 更新 socket
-    self._socks[matched] = _Sock(sock)
+def send(self, payload: bytes) -> bytes:
+    with self._lock:
+        ...
+        sock = self._socks[ecu]
+
+        try:
+            sock.send(frame)           # sock=None → AttributeError，
+            response = sock.recv()     # 网络断开 → ConnectionError/TimeoutError/OSError
+        except (ConnectionError, TimeoutError, OSError, AttributeError):
+            sock = self._reconnect(ecu)   # 抢救一次
+            try:
+                sock.send(frame)          # 重发
+                response = sock.recv()
+            except (ConnectionError, TimeoutError, OSError):
+                self._socks[ecu] = None   # 清空，下次 send 可再次触发重连
+                raise ConnectionError(...)
+    ...
 ```
 
-- 重连时严格校验：收到 IP 不在 ecus 表中 → 直接拒绝 + 抛异常
-- 与 accept 不同：accept 宽松（只是 warn+close），reconnect 严格（直接报错，因为已经在通信中）
+**`_reconnect` 逻辑**：清旧 sock → 置 None → 调 `_accept4connect` 循环 accept → 检查目标是否连上 → 连上返 sock，未连抛 `TimeoutError`。
+
+**恢复机制**：清空后下次 `send()`，sock 为 None → `AttributeError` 落入同一个 except → `_reconnect` 再次尝试——ECU 恢复连接就能自动续上。
 
 **6. connections 返回**
 
@@ -250,14 +251,15 @@ def connections(self) -> dict[int, tuple[str, int, bool]]:
 
 **8. 命名与改名**
 
-| 原名称 | 新名称 | 说明 |
-|--------|--------|------|
-| `Sock` | `_Sock` | 内部，前缀 `_` |
+| 原名称             | 新名称              | 说明                              |
+|-----------------|------------------|---------------------------------|
+| `Sock`          | `_Sock`          | 内部，前缀 `_`                       |
 | `SocketManager` | `_SocketManager` | 可能合并进 Endpoint（表管理逻辑简化后独立类意义不大） |
-| `Protocol` | `_Protocol` | 内部，前缀 `_` |
-| `DoIPEndpoint` | `Endpoint` | 唯一公开的类 |
+| `Protocol`      | `_Protocol`      | 内部，前缀 `_`                       |
+| `DoIPEndpoint`  | `Endpoint`       | 唯一公开的类                          |
 
 参数名调整：
+
 - `DoIPEndpoint.send(uds)` → `Endpoint.send(payload)`
 - `Protocol.encode(uds, ...)` → `_Protocol.encode(payload, ...)`
 
@@ -275,13 +277,13 @@ __all__ = ["Endpoint", "Config", "ProtocolError"]
 
 #### 为什么只公开 3 个 API？
 
-| 类 | 能否被外部直接使用？ | 决策 |
-|----|-------------------|------|
-| `Endpoint` | 用户直接使用 | **公开** |
-| `Config` | 用户创建配置 | **公开** |
-| `ProtocolError` | 用户需要 catch | **公开** |
-| `_Protocol` | 只被 Endpoint 内部使用 | **内部** |
-| `_Sock` | 只被 Endpoint 内部使用 | **内部** |
+| 类               | 能否被外部直接使用？       | 决策     |
+|-----------------|------------------|--------|
+| `Endpoint`      | 用户直接使用           | **公开** |
+| `Config`        | 用户创建配置           | **公开** |
+| `ProtocolError` | 用户需要 catch       | **公开** |
+| `_Protocol`     | 只被 Endpoint 内部使用 | **内部** |
+| `_Sock`         | 只被 Endpoint 内部使用 | **内部** |
 
 用户不需要绕过 `Endpoint` 直接操作 socket 或手拼 DoIP 帧。后续支持"主动连接"模式也只需改内部实现，公开 API 不变。
 
@@ -302,8 +304,8 @@ from autodoip import Endpoint
 endpoint = Endpoint(
     ip='198.18.44.1',
     ecus={
-        0x1301: ('198.18.44.49', 0),     # port=0，忽略端口校验
-        0x1302: ('198.18.44.50', 13400), # 精确匹配 IP + port
+        0x1301: ('198.18.44.49', 0),  # port=0，忽略端口校验
+        0x1302: ('198.18.44.50', 13400),  # 精确匹配 IP + port
     },
 )
 
@@ -314,8 +316,8 @@ print(endpoint.connections())
 # {0x1301: ('198.18.44.49', 0, True), 0x1302: ('198.18.44.50', 13400, False)}
 
 # 切换到已连接的 ECU
-ok = endpoint.select(0x1301)      # → True（已连接，切换成功）
-ok = endpoint.select(0x1302)      # → False（未连接，保持当前不变）
+ok = endpoint.select(0x1301)  # → True（已连接，切换成功）
+ok = endpoint.select(0x1302)  # → False（未连接，保持当前不变）
 
 # 发送诊断请求
 response = endpoint.send(bytes.fromhex('22DC06'))
@@ -325,15 +327,15 @@ endpoint.stop()
 
 ### 公开 API 速览
 
-| 符号 | 说明 |
-|------|------|
-| `Endpoint(ip, ecus, ...)` | ip + ecus 必传；port/tester/config 可选 |
-| `Endpoint.start()` / `stop()` | 启停 DoIP 监听 |
-| `Endpoint.select(addr) -> bool` | 按逻辑地址切换 ECU，成功返 True；未连接返 False 且不切不退 |
-| `Endpoint.send(payload) -> bytes` | 发送 UDS 载荷，返回响应 bytes |
+| 符号                                                           | 说明                                             |
+|--------------------------------------------------------------|------------------------------------------------|
+| `Endpoint(ip, ecus, ...)`                                    | ip + ecus 必传；port/tester/config 可选             |
+| `Endpoint.start()` / `stop()`                                | 启停 DoIP 监听                                     |
+| `Endpoint.select(addr) -> bool`                              | 按逻辑地址切换 ECU，成功返 True；未连接返 False 且不切不退          |
+| `Endpoint.send(payload) -> bytes`                            | 发送 UDS 载荷，返回响应 bytes                           |
 | `Endpoint.connections() -> dict[int, tuple[str, int, bool]]` | `{addr: (ip, port, connected), ...}` 含全部声明 ECU |
-| `Config(...)` | @dataclass，传输调优参数，全部有默认值 |
-| `ProtocolError` | Exception，帧校验失败 |
+| `Config(...)`                                                | @dataclass，传输调优参数，全部有默认值                       |
+| `ProtocolError`                                              | Exception，帧校验失败                                |
 
 ### 参数归类
 
@@ -358,21 +360,40 @@ tester: int          默认 0x0E80      listen_count:   10
 
 ## 6. 已确认决策
 
-| # | 事项 | 决定 |
-|----|------|------|
-| 1 | 参数命名 | `send(payload)` 不用 `send(uds)` |
-| 2 | 类名去前缀 | 全部去掉 `DoIP`/`DoIp`，库名已表态 |
-| 3 | 公开 API 数量 | 仅 3 个：`Endpoint` / `Config` / `ProtocolError` |
-| 4 | 文件拆分 | `_transport.py` 合 4 个类在一个文件，暂不拆 |
-| 5 | `to_bytes` | 复制到 autodoip；`byte_order` 参数必传，不设默认 |
-| 6 | 被动监听 vs 主动连接 | 当前仅实现被动（tester-as-server），主动模式作为后续演进 |
-| 7 | 参数分类 | 身份参数（ip/ecus/port/tester）在 Endpoint 签名；调优参数在 Config |
-| 8 | Endpoint 构造 | `Endpoint(ip, ecus, port=13400, tester=0x0E80, config=None)` |
-| 9 | `ecus` 设计 | `dict[int, tuple[str, int]]` — 逻辑地址→(ECU_IP, ECU_port)，port=0 忽略端口；**必传** |
-| 10 | `select` 语义 | 目标未连接 → 返回 `False`，不切换、不抛异常、不退。上层自行决定 |
-| 11 | 连接表 | 启动时预建全表，sock=None 占位；accept 匹配成功则填入；始终保留未连上的 ECU |
-| 12 | accept 过滤 | 收到不在 ecus 表中的 IP → warn + 关闭该 socket；在表中但未连上的保持 None 不报错 |
-| 13 | reconnect 过滤 | 收到不在 ecus 表中的 IP → 直接拒绝 + 抛 ConnectionError |
-| 14 | `connections()` | 返回 `{addr: (ip, port, connected), ...}`，含全部声明 ECU 及连接状态 |
-| 15 | 语义边界 | Endpoint 不感知 ECU 名称（`"mcu"`）。Session 自行维护 `name→addr` 映射给 `on(name)` 用 |
-| 16 | Config | 移除 `port`/`tester`，这两个身份参数统一从 Endpoint 取 |
+| #   | 事项              | 决定                                                                           |
+|-----|-----------------|------------------------------------------------------------------------------|
+| 1   | 参数命名            | `send(payload)` 不用 `send(uds)`                                               |
+| 2   | 类名去前缀           | 全部去掉 `DoIP`/`DoIp`，库名已表态                                                     |
+| 3   | 公开 API 数量       | 仅 3 个：`Endpoint` / `Config` / `ProtocolError`                                |
+| 4   | 文件拆分            | `_transport.py` 合 4 个类在一个文件，暂不拆                                              |
+| 5   | `to_bytes`      | 复制到 autodoip；`byte_order` 参数必传，不设默认                                          |
+| 6   | 被动监听 vs 主动连接    | 当前仅实现被动（tester-as-server），主动模式作为后续演进                                         |
+| 7   | 参数分类            | 身份参数（ip/ecus/port/tester）在 Endpoint 签名；调优参数在 Config                          |
+| 8   | Endpoint 构造     | `Endpoint(ip, ecus, port=13400, tester=0x0E80, config=None)`                 |
+| 9   | `ecus` 设计       | `dict[int, tuple[str, int]]` — 逻辑地址→(ECU_IP, ECU_port)，port=0 忽略端口；**必传**    |
+| 10  | `select` 语义     | 目标未连接 → 返回 `False`，不切换、不抛异常、不退。上层自行决定                                        |
+| 11  | 连接表             | 启动时预建全表，sock=None 占位；accept 匹配成功则填入；始终保留未连上的 ECU                             |
+| 12  | accept 过滤       | 收到不在 ecus 表中的 IP → warn + close；在表中未连上的保持 None                               |
+| 13  | 重连机制            | `_accept4connect` 在 `start()` 和 `send()` 出错时调用。`_reconnect` 封装清旧→accept→检查逻辑         |
+| 13a | send 错误统一        | `ConnectionError/TimeoutError/OSError/AttributeError` 统一走 except → `_reconnect` → 重发一次        |
+| 14  | `connections()` | 返回 `{addr: (ip, port, connected), ...}`，含全部声明 ECU 及连接状态                      |
+| 15  | 语义边界            | Endpoint 不感知 ECU 名称（`"mcu"`）。Session 自行维护 `name→addr` 映射给 `on(name)` 用       |
+| 16  | Config          | 移除 `port`/`tester`/`reconnect_timeout`——身份参数从 Endpoint 取，重连复用 accept_timeout |
+
+---
+
+## 7. 已知硬伤
+
+> 2026-06-03 代码审查发现。2026-06-04 全部修完。
+
+### ~~#1 `_reconnect` 单次 accept~~（已修）
+
+`_reconnect` 改为调用 `_accept4connect`，循环 accept + 填表，自然支持多 ECU 并发重连。
+
+### ~~#2 重复匹配逻辑~~（已修）
+
+`_reconnect` 复用 `_accept4connect`，不再自写 accept 逻辑。
+
+### ~~#3 `send()` 中 `sock` 可能为 None~~（已修）
+
+`sock` 为 None 时 `sock.send()` 抛 `AttributeError`，与网络错误统一走同一个 except → `_reconnect` 抢救。

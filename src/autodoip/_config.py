@@ -14,7 +14,6 @@ class Config:
     """DoIP 传输层调优参数。全部有默认值，传入则覆盖。"""
     accept_timeout: float = 1.5
     recv_timeout: float = 3.0
-    reconnect_timeout: float = 5.0
     listen_count: int = 5
     version: int = 0x02
     msg_type: int = 0x8001
