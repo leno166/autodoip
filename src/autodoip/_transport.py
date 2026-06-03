@@ -3,7 +3,7 @@
 @作者: 雷小鸥
 @日期: 2026/6/3
 @许可: MIT License
-@描述: DoIP 传输层 — Sock + Protocol + Endpoint
+@描述: DoIp 传输层 — Sock + Protocol + Endpoint
        零外部依赖（除 stdlib socket + threading）
 """
 import threading
@@ -41,7 +41,7 @@ class _Sock:
 # ================== _Protocol ==================
 
 class _Protocol:
-    """DoIP 帧编解码，无状态。
+    """DoIp 帧编解码，无状态。
 
     Raises:
         ProtocolError: 帧格式校验失败 — 版本反码、Payload Type、长度、地址不匹配。
@@ -116,7 +116,7 @@ class _Protocol:
 # ================== Endpoint ==================
 
 class Endpoint:
-    """DoIP 端点：整合 Server Socket + 连接表 + Protocol + Lock + 自动重连。
+    """DoIp 端点：整合 Server Socket + 连接表 + Protocol + Lock + 自动重连。
 
     Raises:
         ValueError: select 传入未知 ECU 地址。
@@ -156,7 +156,7 @@ class Endpoint:
     # --- 生命周期 ---
 
     def start(self) -> None:
-        """启动 DoIP 监听，accept 等待 ECU 连接。幂等，重复调用无副作用。"""
+        """启动 DoIp 监听，accept 等待 ECU 连接。幂等，重复调用无副作用。"""
         with self._lock:
             if self._server is not None:
                 return
@@ -166,7 +166,7 @@ class Endpoint:
             sock.bind((self._ip, self._port))
             sock.listen(self._config.listen_count)
             self._server = sock
-            logger.info("DoIP 服务启动，监听 %s:%d，backlog %d",
+            logger.info("DoIp 服务启动，监听 %s:%d，backlog %d",
                         self._ip, self._port, self._config.listen_count)
             self._accept4connect()
 
@@ -234,11 +234,11 @@ class Endpoint:
         """
         with self._lock:
             if self._current is None:
-                raise ProtocolError('DoIP: 没有设置 ecu 逻辑地址')
+                raise ProtocolError('DoIp: 没有设置 ecu 逻辑地址')
 
             ecu = self._current
             frame = self._protocol.encode(payload, self._tester, ecu)
-            logger.debug('TX DoIP: %s', frame.hex(' '))
+            logger.debug('TX DoIp: %s', frame.hex(' '))
 
             sock = self._socks[ecu]
 
@@ -246,7 +246,7 @@ class Endpoint:
                 sock.send(frame)
                 response = sock.recv()
             except (ConnectionError, TimeoutError, OSError, AttributeError) as e:
-                logger.warning('DoIP 通信失败，触发重连: %s', e)
+                logger.warning('DoIp 通信失败，触发重连: %s', e)
                 sock = self._reconnect(ecu)
                 try:
                     sock.send(frame)
@@ -256,7 +256,7 @@ class Endpoint:
                     logger.error('重连后仍失败，清空连接', exc_info=True)
                     raise ConnectionError(f'ECU 0x{ecu:04X} 连接断开')
 
-        logger.debug('RX DoIP: %s', response.hex(' '))
+        logger.debug('RX DoIp: %s', response.hex(' '))
         return self._protocol.decode(response, self._tester, ecu)
 
     # --- 内部 ---
