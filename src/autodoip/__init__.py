@@ -7,8 +7,8 @@
        ISO 13400 compliant.
 """
 
-from ._transport import Endpoint as Endpoint
-from ._config import Config as Config
-from ._errors import ProtocolError as ProtocolError
+from ._transport import Endpoint
+from ._config import Config
+from ._errors import ProtocolError
 
 __all__ = ["Endpoint", "Config", "ProtocolError"]

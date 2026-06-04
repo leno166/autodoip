@@ -8,14 +8,14 @@
 """
 import threading
 import socket
-from typing import Literal
-from logging import getLogger
+from typing import Literal, Iterator
+import logging
 
 from ._frame import recv_frame
 from ._errors import ProtocolError
 from ._config import Config
 
-logger = getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 # ================== _Sock ==================
@@ -227,7 +227,7 @@ class Endpoint:
 
     # --- 收发 ---
 
-    def send(self, payload: bytes) -> bytes:
+    def conversation(self, payload: bytes) -> Iterator[bytes]:
         """发送 UDS 载荷，返回响应 bytes。
         通信失败（含 sock 为 None）→ _reconnect 抢救一次；
         抢救后重发仍失败 → 清空 sock 并抛异常。
@@ -238,26 +238,37 @@ class Endpoint:
 
             ecu = self._current
             frame = self._protocol.encode(payload, self._tester, ecu)
-            logger.debug('TX DoIp: %s', frame.hex(' '))
-
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug('TX DoIp: %s', frame.hex(' '))
             sock = self._socks[ecu]
 
+            # --- send（一次，带抢救） ---
             try:
                 sock.send(frame)
-                response = sock.recv()
-            except (ConnectionError, TimeoutError, OSError, AttributeError) as e:
-                logger.warning('DoIp 通信失败，触发重连: %s', e)
+            except (ConnectionError, OSError, AttributeError) as e:
+                logger.warning('DoIp send 失败，触发重连: %s', e)
                 sock = self._reconnect(ecu)
                 try:
                     sock.send(frame)
-                    response = sock.recv()
-                except (ConnectionError, TimeoutError, OSError):
+                except (ConnectionError, OSError, AttributeError):
                     self._socks[ecu] = None
-                    logger.error('重连后仍失败，清空连接', exc_info=True)
+                    logger.error('重连后 send 仍失败，清空连接', exc_info=True)
                     raise ConnectionError(f'ECU 0x{ecu:04X} 连接断开')
 
-        logger.debug('RX DoIp: %s', response.hex(' '))
-        return self._protocol.decode(response, self._tester, ecu)
+            # --- recv 循环 ---
+            while True:
+                try:
+                    response = sock.recv()
+                except TimeoutError:
+                    return
+                except (ConnectionError, OSError, AttributeError) as e:
+                    logger.warning('DoIp recv 失败，清空连接: %s', e)
+                    self._socks[ecu] = sock = None
+                    return
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug('RX DoIp: %s', response.hex(' '))
+                yield self._protocol.decode(response, self._tester, ecu)
 
     # --- 内部 ---
 
@@ -269,19 +280,25 @@ class Endpoint:
         if not self._server:
             raise RuntimeError("服务未启动")
 
-        logger.info('accept 启动')
+        logger.debug('accept 启动')
+        pending = []
         while True:
             try:
                 sock, addr = self._server.accept()
                 logger.debug('accept | addr: %s', addr)
+                src_ip, src_port = addr
+                pending.append((sock, src_ip, src_port))
             except TimeoutError:
-                logger.debug('accept 超时退出')
+                logger.debug('accept 超时退出，共收集 %d 条连接', len(pending))
+
+                if len(pending) == 0:
+                    raise RuntimeError('没有任何连接端口，直接退出')
                 break
 
-            src_ip, src_port = addr
+        # 阶段 2: 处理（原逻辑不变）
+        for sock, src_ip, src_port in pending:
             sock.settimeout(self._config.recv_timeout)
 
-            # 在 ecus 表中查找匹配的 ECU
             matched = next(
                 (a for a, (e_ip, e_port) in self._ecus.items()
                  if e_ip == src_ip and (e_port == 0 or e_port == src_port)),
@@ -289,11 +306,10 @@ class Endpoint:
             )
 
             if matched is None:
-                logger.info("收到非预期连接 %s:%d，不在 ECU 表中，已关闭", src_ip, src_port)
+                logger.warning("收到非预期连接 %s:%d，不在 ECU 表中，已关闭", src_ip, src_port)
                 sock.close()
                 continue
 
-            # 关闭已有连接（同一 ECU 重连）
             old = self._socks[matched]
             if old is not None:
                 old.close()

@@ -121,7 +121,7 @@ class ProtocolError(Exception):
 
 #### `_transport.py` — 传输层
 
-含 4 个类：`_Sock` + `_Protocol` + `Endpoint`（整合了原 SocketManager）。
+含 3 个类：`_Sock` + `_Protocol` + `Endpoint`。
 
 **1. Endpoint 构造函数**
 
@@ -172,7 +172,7 @@ self._socks: dict[int, _Sock | None] = {addr: None for addr in ecus}
 
 `start()` 启动时调一次 `_accept4connect`：`accept_timeout` 内循环 accept，匹配 ecus 填表，超时退出。
 
-之后不再自动运行——只在 `send()` 出错时被触发。
+之后不再自动运行——只在 `conversation()` send 阶段出错时被触发。
 
 **4. select 行为**
 
@@ -191,33 +191,43 @@ def select(self, addr: int) -> bool:
 - 目标 ECU 未连接 → 返回 `False`，**不切换、不抛异常、不退**
 - 上层（Session）收到 `False` 可以自己决定处理——忽略、重试、或上报给用户
 
-**5. send 与重连**
+**5. conversation 与重连**
 
-`sock.send()` 失败和 `sock` 为 None 统一经过同一个 except 处理：
+`conversation()` 返回 `Iterator[bytes]`，支持 ECU 连续返回多帧（如延迟指示 0x7F...0x78 后跟实际响应）。send 和 recv 分开处理，各自有独立的重连/恢复逻辑：
 
 ```python
-def send(self, payload: bytes) -> bytes:
+def conversation(self, payload: bytes) -> Iterator[bytes]:
     with self._lock:
         ...
         sock = self._socks[ecu]
 
+        # --- send（一次，带抢救） ---
         try:
-            sock.send(frame)           # sock=None → AttributeError，
-            response = sock.recv()     # 网络断开 → ConnectionError/TimeoutError/OSError
-        except (ConnectionError, TimeoutError, OSError, AttributeError):
-            sock = self._reconnect(ecu)   # 抢救一次
+            sock.send(frame)           # sock=None → AttributeError
+        except (ConnectionError, OSError, AttributeError):
+            sock = self._reconnect(ecu)
             try:
-                sock.send(frame)          # 重发
-                response = sock.recv()
-            except (ConnectionError, TimeoutError, OSError):
-                self._socks[ecu] = None   # 清空，下次 send 可再次触发重连
+                sock.send(frame)       # 重发
+            except (ConnectionError, OSError, AttributeError):
+                self._socks[ecu] = None
                 raise ConnectionError(...)
-    ...
+
+        # --- recv 循环 ---
+        while True:
+            try:
+                response = sock.recv()
+            except TimeoutError:
+                return               # 接收窗口超时，正常退出
+            except (ConnectionError, OSError, AttributeError):
+                self._socks[ecu] = sock = None
+                return               # 连接断开，清空退出
+
+            yield self._protocol.decode(response, ...)
 ```
 
 **`_reconnect` 逻辑**：清旧 sock → 置 None → 调 `_accept4connect` 循环 accept → 检查目标是否连上 → 连上返 sock，未连抛 `TimeoutError`。
 
-**恢复机制**：清空后下次 `send()`，sock 为 None → `AttributeError` 落入同一个 except → `_reconnect` 再次尝试——ECU 恢复连接就能自动续上。
+**恢复机制**：recv 断开 → 清空 sock。下次 `conversation()` 时 sock 为 None → `AttributeError` 落入 send 的 except → `_reconnect` 再次尝试。ECU 恢复连接就能自动续上。
 
 **6. connections 返回**
 
@@ -236,20 +246,19 @@ def connections(self) -> dict[int, tuple[str, int, bool]]:
 
 **7. 内部组件接收具体值，不接触 Config**
 
-`_Protocol` / `_SocketManager` 的构造函数接收 `version`、`msg_type`、`byte_order` 等具体值，不依赖也不引用 `Config`。依赖链单向：`Config` → `Endpoint` → 内部组件。
+`_Protocol` / `_Sock` 的构造函数接收 `version`、`msg_type`、`byte_order` 等具体值，不依赖也不引用 `Config`。依赖链单向：`Config` → `Endpoint` → 内部组件。
 
 **8. 命名与改名**
 
 | 原名称             | 新名称              | 说明                              |
 |-----------------|------------------|---------------------------------|
 | `Sock`          | `_Sock`          | 内部，前缀 `_`                       |
-| `SocketManager` | `_SocketManager` | 可能合并进 Endpoint（表管理逻辑简化后独立类意义不大） |
 | `Protocol`      | `_Protocol`      | 内部，前缀 `_`                       |
 | `DoIPEndpoint`  | `Endpoint`       | 唯一公开的类                          |
 
 参数名调整：
 
-- `DoIPEndpoint.send(uds)` → `Endpoint.send(payload)`
+- `DoIPEndpoint.send(uds)` → `Endpoint.conversation(payload)`
 - `Protocol.encode(uds, ...)` → `_Protocol.encode(payload, ...)`
 
 #### `__init__.py` — 公开 API
@@ -308,8 +317,9 @@ print(endpoint.connections())
 ok = endpoint.select(0x1301)  # → True（已连接，切换成功）
 ok = endpoint.select(0x1302)  # → False（未连接，保持当前不变）
 
-# 发送诊断请求
-response = endpoint.send(bytes.fromhex('22FF00'))
+# 发送诊断请求（返回迭代器，支持多帧响应）
+for response in endpoint.conversation(bytes.fromhex('22FF00')):
+    print(response.hex(' '))
 
 endpoint.stop()
 ```
@@ -321,7 +331,7 @@ endpoint.stop()
 | `Endpoint(ip, ecus, ...)`                                    | ip + ecus 必传；port/tester/config 可选             |
 | `Endpoint.start()` / `stop()`                                | 启停 DoIP 监听                                     |
 | `Endpoint.select(addr) -> bool`                              | 按逻辑地址切换 ECU，成功返 True；未连接返 False 且不切不退          |
-| `Endpoint.send(payload) -> bytes`                            | 发送 UDS 载荷，返回响应 bytes                           |
+| `Endpoint.conversation(payload) -> Iterator[bytes]`                            | 发送 UDS 载荷，返回响应迭代器（支持多帧）                   |
 | `Endpoint.connections() -> dict[int, tuple[str, int, bool]]` | `{addr: (ip, port, connected), ...}` 含全部声明 ECU |
 | `Config(...)`                                                | @dataclass，传输调优参数，全部有默认值                       |
 | `ProtocolError`                                              | Exception，帧校验失败                                |
@@ -343,7 +353,7 @@ tester: int          默认 0x0E80      listen_count:   5
 - Endpoint 签名的 `port`/`tester` 有默认值但不在 Config 中——它们是连接身份而非调优参数
 - Config 只含行为调优参数，全部有默认值
 - `to_bytes(value, byte_order)` 不设默认，`byte_order` 由 Endpoint 从 Config 取后传入
-- 内部组件（`_Protocol`、`_SocketManager`）接收具体值，不接触 Config
+- 内部组件（`_Protocol`、`_Sock`）接收具体值，不接触 Config
 
 ---
 
@@ -363,8 +373,8 @@ tester: int          默认 0x0E80      listen_count:   5
 | 10  | `select` 语义     | 目标未连接 → 返回 `False`，不切换、不抛异常、不退。上层自行决定                                        |
 | 11  | 连接表             | 启动时预建全表，sock=None 占位；accept 匹配成功则填入；始终保留未连上的 ECU                             |
 | 12  | accept 过滤       | 收到不在 ecus 表中的 IP → warn + close；在表中未连上的保持 None                               |
-| 13  | 重连机制            | `_accept4connect` 在 `start()` 和 `send()` 出错时调用。`_reconnect` 封装清旧→accept→检查逻辑         |
-| 13a | send 错误统一        | `ConnectionError/TimeoutError/OSError/AttributeError` 统一走 except → `_reconnect` → 重发一次        |
+| 13  | 重连机制            | `_accept4connect` 在 `start()` 和 `conversation()` send 失败时调用。`_reconnect` 封装清旧→accept→检查逻辑         |
+| 13a | send 错误统一        | `ConnectionError/OSError/AttributeError` 统一走 except → `_reconnect` → 重发一次；recv 错误（同组异常）清空 sock 并退出        |
 | 14  | `connections()` | 返回 `{addr: (ip, port, connected), ...}`，含全部声明 ECU 及连接状态                      |
 | 15  | 语义边界            | Endpoint 不感知 ECU 名称（`"mcu"`）。Session 自行维护 `name→addr` 映射给 `on(name)` 用       |
 | 16  | Config          | 移除 `port`/`tester`/`reconnect_timeout`——身份参数从 Endpoint 取，重连复用 accept_timeout |
