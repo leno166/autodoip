@@ -75,7 +75,24 @@ return header + inner
 
 ---
 
-## 6. 已讨论且确认不修改的设计决策
+## 6. 锁粒度过粗：对话中 stop/select 被阻塞
+
+**文件**: `src/autodoip/_transport.py` — `Endpoint`
+
+**描述**: 当前全部操作用单一 `self._lock = RLock()` 保护，`conversation()` 持有锁跨 `yield`。副作用：
+
+- **对话中 `stop()` 死锁**：另一线程调用 `stop()` 等待锁，而锁被对话生成器持有，直到生成器被消费完或 GC 才释放。
+- **对话中 `select()` / `connections()` / `current` 被阻塞**：同因。
+
+已有对应并发测试用例（`test_select_not_blocked_during_conversation`、`test_stop_during_conversation`），当前标记为 `xfail`。
+
+**修复方向**: 拆分为 `_state_lock`（保护 `_socks`/`_current`/`_busy`）+ `_idle_event`（空闲通知），`conversation()` 仅在进入时获取状态锁设置 `_busy`，yield 时不持锁，finally 中恢复。详见 `test_concurrency.py` 中两个 xfail 用例注释。
+
+**状态**: 🔵 未来修改。当前 stop 无并发调用需求，不优先。
+
+---
+
+## 7. 已讨论且确认不修改的设计决策
 
 以下问题经过讨论，确认为设计意图，**不做修改**：
 
