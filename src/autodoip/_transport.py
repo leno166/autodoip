@@ -8,6 +8,7 @@
 """
 import threading
 import socket
+import time
 from typing import Literal, Iterator
 import logging
 
@@ -24,9 +25,12 @@ class _Sock:
     """单个 socket 封装，send/recv/close"""
 
     def __init__(self, sock: socket.socket,
-                 byte_order: Literal['little', 'big'] = 'big'):
+                 byte_order: Literal['little', 'big'],
+                 p6: float):
         self._sock = sock
         self._byte_order: Literal['little', 'big'] = byte_order
+        self._p6 = p6
+        self._sock.settimeout(p6)
 
     def send(self, msg: bytes) -> None:
         self._sock.sendall(msg)
@@ -153,6 +157,25 @@ class Endpoint:
         # server socket
         self._server: socket.socket | None = None
 
+    # --- 连接表 ---
+
+    @property
+    def connections(self) -> dict[int, tuple[str, int, bool]]:
+        """返回全部 ECU 及其连接状态。
+        {addr: (ip, port, connected), ...}
+        """
+        with self._lock:
+            return {
+                addr: (ip, port, self._socks[addr] is not None)
+                for addr, (ip, port) in self._ecus.items()
+            }
+
+    @property
+    def current(self) -> int | None:
+        """当前选中的 ECU 逻辑地址。"""
+        with self._lock:
+            return self._current
+
     # --- 生命周期 ---
 
     def start(self) -> None:
@@ -194,18 +217,6 @@ class Endpoint:
             self._current = None
             logger.info("所有 socket 已关闭")
 
-    # --- 连接表 ---
-
-    def connections(self) -> dict[int, tuple[str, int, bool]]:
-        """返回全部 ECU 及其连接状态。
-        {addr: (ip, port, connected), ...}
-        """
-        with self._lock:
-            return {
-                addr: (ip, port, self._socks[addr] is not None)
-                for addr, (ip, port) in self._ecus.items()
-            }
-
     def select(self, addr: int) -> bool:
         """切换到指定逻辑地址的 ECU。
         成功返回 True；ECU 未连接返回 False 且不改变当前选中。
@@ -218,12 +229,6 @@ class Endpoint:
                 return False
             self._current = addr
             return True
-
-    @property
-    def current(self) -> int | None:
-        """当前选中的 ECU 逻辑地址。"""
-        with self._lock:
-            return self._current
 
     # --- 收发 ---
 
@@ -255,17 +260,25 @@ class Endpoint:
                     logger.error('重连后 send 仍失败，清空连接', exc_info=True)
                     raise ConnectionError(f'ECU 0x{ecu:04X} 连接断开')
 
-            # --- recv 循环 ---
+            # --- recv 循环，p6_star 为总超时 ---
+            deadline = time.monotonic() + self._config.p6_star_timeout
+            first = True
             while True:
+                if time.monotonic() >= deadline:
+                    return
+
                 try:
                     response = sock.recv()
                 except TimeoutError:
-                    return
+                    if first:
+                        return
+                    continue
                 except (ConnectionError, OSError, AttributeError) as e:
                     logger.warning('DoIp recv 失败，清空连接: %s', e)
                     self._socks[ecu] = sock = None
                     return
 
+                first = False
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug('RX DoIp: %s', response.hex(' '))
                 yield self._protocol.decode(response, self._tester, ecu)
@@ -297,7 +310,6 @@ class Endpoint:
 
         # 阶段 2: 处理（原逻辑不变）
         for sock, src_ip, src_port in pending:
-            sock.settimeout(self._config.recv_timeout)
 
             matched = next(
                 (a for a, (e_ip, e_port) in self._ecus.items()
@@ -315,7 +327,8 @@ class Endpoint:
                 old.close()
                 logger.info("ECU 0x%04X 关闭已有连接", matched)
 
-            self._socks[matched] = _Sock(sock, self._config.byte_order)
+            self._socks[matched] = _Sock(sock, self._config.byte_order,
+                                         p6=self._config.p6_timeout)
             logger.info("ECU 已连接 0x%04X @ %s:%d", matched, src_ip, src_port)
 
     def _reconnect(self, addr: int) -> _Sock:
