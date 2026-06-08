@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # ================== _Sock ==================
 
 class _Sock:
-    """单个 socket 封装，send/recv/close"""
+    """单个 socket 封装，send/recv。资源由 CPython GC 回收。"""
 
     def __init__(self, sock: socket.socket,
                  byte_order: Literal['little', 'big'],
@@ -32,14 +32,14 @@ class _Sock:
         self._p6 = p6
         self._sock.settimeout(p6)
 
+    def __del__(self) -> None:
+        self._sock.close()
+
     def send(self, msg: bytes) -> None:
         self._sock.sendall(msg)
 
     def recv(self) -> bytes:
         return recv_frame(self._sock, self._byte_order)
-
-    def close(self) -> None:
-        self._sock.close()
 
 
 # ================== _Protocol ==================
@@ -120,7 +120,8 @@ class _Protocol:
 # ================== Endpoint ==================
 
 class Endpoint:
-    """DoIp 端点：整合 Server Socket + 连接表 + Protocol + Lock + 自动重连。
+    """DoIp 端点：整合 Server Socket + 连接表 + Protocol + 双锁 + 自动重连。
+    资源由 CPython GC 回收，仅 _Sock.__del__ 关闭底层 socket。
 
     Raises:
         ValueError: select 传入未知 ECU 地址。
@@ -152,7 +153,8 @@ class Endpoint:
             addr: None for addr in self._ecus
         }
         self._current: int | None = None
-        self._lock = threading.RLock()
+        self._state_lock = threading.Lock()
+        self._session_lock = threading.Lock()
 
         # server socket
         self._server: socket.socket | None = None
@@ -164,7 +166,7 @@ class Endpoint:
         """返回全部 ECU 及其连接状态。
         {addr: (ip, port, connected), ...}
         """
-        with self._lock:
+        with self._state_lock:
             return {
                 addr: (ip, port, self._socks[addr] is not None)
                 for addr, (ip, port) in self._ecus.items()
@@ -173,62 +175,64 @@ class Endpoint:
     @property
     def current(self) -> int | None:
         """当前选中的 ECU 逻辑地址。"""
-        with self._lock:
+        with self._state_lock:
             return self._current
 
     # --- 生命周期 ---
 
     def start(self) -> None:
-        """启动 DoIp 监听，accept 等待 ECU 连接。幂等，重复调用无副作用。"""
-        with self._lock:
-            if self._server is not None:
-                return
+        """启动 DoIp 监听，accept 等待 ECU 连接。幂等，重复调用无副作用。
+
+        Raises:
+            RuntimeError: 另一个操作正在进行中。
+        """
+        if not self._session_lock.acquire(blocking=False):
+            raise RuntimeError("另一个操作正在进行中，无法启动")
+        try:
+            with self._state_lock:
+                if self._server is not None:
+                    return
+
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.settimeout(self._config.accept_timeout)
             sock.bind((self._ip, self._port))
             sock.listen(self._config.listen_count)
-            self._server = sock
-            logger.info("DoIp 服务启动，监听 %s:%d，backlog %d",
-                        self._ip, self._port, self._config.listen_count)
+
+            with self._state_lock:
+                self._server = sock
+
+            logger.info("DoIp 服务启动，监听 %s:%d，backlog %d", self._ip, self._port, self._config.listen_count)
             self._accept4connect()
-
-    def stop(self) -> None:
-        """关闭所有连接和 server socket。"""
-        with self._lock:
-            for addr, s in self._socks.items():
-                if s is not None:
-                    try:
-                        s.close()
-                        logger.debug("关闭 ECU 0x%04X 的 socket", addr)
-                    except Exception as e:
-                        logger.error("关闭 ECU 0x%04X 的 socket 时出错: %s",
-                                     addr, e, exc_info=True)
-            self._socks = {addr: None for addr in self._ecus}
-
-            if self._server:
-                try:
-                    self._server.close()
-                    logger.debug("关闭服务端 socket")
-                except Exception as e:
-                    logger.error("关闭服务端 socket 时出错: %s", e, exc_info=True)
-                self._server = None
-
-            self._current = None
-            logger.info("所有 socket 已关闭")
+        finally:
+            self._session_lock.release()
 
     def select(self, addr: int) -> bool:
         """切换到指定逻辑地址的 ECU。
-        成功返回 True；ECU 未连接返回 False 且不改变当前选中。
+        成功返回 True；ECU 未连接或另一个操作正在进行中返回 False 且不改变当前选中。
+
+        Raises:
+            ValueError: addr 不在 ecus 表中。
         """
-        with self._lock:
-            if addr not in self._ecus:
+        if not self._session_lock.acquire(blocking=False):
+            return False
+        try:
+            with self._state_lock:
+                ecus = self._ecus
+                socks = self._socks
+
+            if addr not in ecus:
                 raise ValueError(f"未知 ECU 逻辑地址: 0x{addr:04X}")
-            if self._socks[addr] is None:
+            if socks[addr] is None:
                 logger.warning("ECU 0x%04X 尚未连接，保持当前选中 ECU", addr)
                 return False
-            self._current = addr
+
+            with self._state_lock:
+                self._current = addr
+
             return True
+        finally:
+            self._session_lock.release()
 
     # --- 收发 ---
 
@@ -236,16 +240,23 @@ class Endpoint:
         """发送 UDS 载荷，返回响应 bytes。
         通信失败（含 sock 为 None）→ _reconnect 抢救一次；
         抢救后重发仍失败 → 清空 sock 并抛异常。
-        """
-        with self._lock:
-            if self._current is None:
-                raise ProtocolError('DoIp: 没有设置 ecu 逻辑地址')
 
-            ecu = self._current
-            frame = self._protocol.encode(payload, self._tester, ecu)
+        Raises:
+            RuntimeError: 另一个操作正在进行中。
+        """
+        if not self._session_lock.acquire(blocking=False):
+            raise RuntimeError("另一个操作正在进行中，无法发送")
+        try:
+            # 读取状态（持 state_lock，微秒）
+            with self._state_lock:
+                if self._current is None:
+                    raise ProtocolError('DoIp: 没有设置 ecu 逻辑地址')
+                ecu = self._current
+                frame = self._protocol.encode(payload, self._tester, ecu)
+                sock = self._socks[ecu]
+
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug('TX DoIp: %s', frame.hex(' '))
-            sock = self._socks[ecu]
 
             # --- send（一次，带抢救） ---
             try:
@@ -256,89 +267,124 @@ class Endpoint:
                 try:
                     sock.send(frame)
                 except (ConnectionError, OSError, AttributeError):
-                    self._socks[ecu] = None
+                    with self._state_lock:
+                        self._socks[ecu] = None
                     logger.error('重连后 send 仍失败，清空连接', exc_info=True)
                     raise ConnectionError(f'ECU 0x{ecu:04X} 连接断开')
 
-            # --- recv 循环，p6_star 为总超时 ---
+            # --- 首帧（超时 = 无响应，直接返回） ---
             deadline = time.monotonic() + self._config.p6_star_timeout
-            first = True
-            while True:
-                if time.monotonic() >= deadline:
-                    return
+            try:
+                response = sock.recv()
+            except TimeoutError:
+                logger.debug('首帧无响应')
+                return
+            except (ConnectionError, OSError, AttributeError) as e:
+                logger.warning('DoIp recv 失败，清空连接: %s', e)
+                with self._state_lock:
+                    self._socks[ecu] = None
+                return
 
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug('RX DoIp: %s', response.hex(' '))
+            yield self._protocol.decode(response, self._tester, ecu)
+
+            # --- 后续帧（超时继续等，直到 deadline） ---
+            while time.monotonic() < deadline:
                 try:
                     response = sock.recv()
                 except TimeoutError:
-                    if first:
-                        return
                     continue
                 except (ConnectionError, OSError, AttributeError) as e:
                     logger.warning('DoIp recv 失败，清空连接: %s', e)
-                    self._socks[ecu] = sock = None
+                    with self._state_lock:
+                        self._socks[ecu] = None
                     return
 
-                first = False
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug('RX DoIp: %s', response.hex(' '))
                 yield self._protocol.decode(response, self._tester, ecu)
+        finally:
+            self._session_lock.release()
 
     # --- 内部 ---
 
     def _accept4connect(self) -> None:
         """
         单次 accept 循环，获取初始连接。必定超时返回
-        按 ecus 表匹配 IP：匹配成功填入 sock，不在表中则 warn + close。
+        按 ecus 表匹配 IP：匹配成功填入 sock，不在表中则丢弃（GC 回收）。
+
+        调用方保证持有 _session_lock。
         """
-        if not self._server:
+        with self._state_lock:
+            server = self._server
+
+        if not server:
             raise RuntimeError("服务未启动")
 
         logger.debug('accept 启动')
         pending = []
         while True:
             try:
-                sock, addr = self._server.accept()
+                sock, addr = server.accept()
                 logger.debug('accept | addr: %s', addr)
                 src_ip, src_port = addr
                 pending.append((sock, src_ip, src_port))
             except TimeoutError:
                 logger.debug('accept 超时退出，共收集 %d 条连接', len(pending))
-
-                if len(pending) == 0:
-                    raise RuntimeError('没有任何连接端口，直接退出')
+                break
+            except OSError:
+                logger.debug('accept 中断（server 已关闭）')
                 break
 
-        # 阶段 2: 处理（原逻辑不变）
-        for sock, src_ip, src_port in pending:
+        if not pending:
+            raise RuntimeError('没有任何连接端口，直接退出')
 
+        # 阶段 2: 快照（持 state_lock，微秒）
+        with self._state_lock:
+            ecus_items = list(self._ecus.items())
+            current_socks = self._socks.copy()
+            byte_order = self._config.byte_order
+            p6 = self._config.p6_timeout
+
+        # 阶段 3: 匹配 & 创建 _Sock（不持锁）
+        new_entries: dict[int, _Sock] = {}
+        for sock, src_ip, src_port in pending:
             matched = next(
-                (a for a, (e_ip, e_port) in self._ecus.items()
+                (a for a, (e_ip, e_port) in ecus_items
                  if e_ip == src_ip and (e_port == 0 or e_port == src_port)),
                 None
             )
 
             if matched is None:
-                logger.warning("收到非预期连接 %s:%d，不在 ECU 表中，已关闭", src_ip, src_port)
-                sock.close()
+                logger.warning("收到非预期连接 %s:%d，不在 ECU 表中，已丢弃", src_ip, src_port)
                 continue
 
-            old = self._socks[matched]
+            old = current_socks.get(matched)
             if old is not None:
-                old.close()
-                logger.info("ECU 0x%04X 关闭已有连接", matched)
+                logger.info("ECU 0x%04X 替换已有连接", matched)
 
-            self._socks[matched] = _Sock(sock, self._config.byte_order,
-                                         p6=self._config.p6_timeout)
+            new_entries[matched] = _Sock(sock, byte_order, p6=p6)
             logger.info("ECU 已连接 0x%04X @ %s:%d", matched, src_ip, src_port)
+
+        # 阶段 4: 写入（持 state_lock）
+        with self._state_lock:
+            if self._server is None:
+                return
+            self._socks.update(new_entries)
 
     def _reconnect(self, addr: int) -> _Sock:
         """重连指定 ECU。调 _accept4connect 循环 accept 填表，
-        结束后检查目标是否已连接。"""
-        old = self._socks[addr]
-        if old is not None:
-            old.close()
-        self._socks[addr] = None
+        结束后检查目标是否已连接。
+
+        调用方保证持有 _session_lock。
+        """
+        with self._state_lock:
+            self._socks[addr] = None
+
         self._accept4connect()
-        if self._socks[addr] is None:
-            raise TimeoutError(f"ECU 0x{addr:04X} 重连超时")
-        return self._socks[addr]
+
+        with self._state_lock:
+            if self._socks[addr] is None:
+                raise TimeoutError(f"ECU 0x{addr:04X} 重连超时")
+            return self._socks[addr]
