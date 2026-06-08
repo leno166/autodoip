@@ -56,7 +56,7 @@ def _make_endpoint(tester: int = TESTER, ecu: int = ECU) -> Endpoint:
     """构造已注入 mock _Sock 的 Endpoint（跳过 start/accept）。"""
     ep = Endpoint(ip='0.0.0.0', ecus={ecu: ('10.0.0.1', 0)}, tester=tester)
     mock_raw = MagicMock()
-    mock_sock = _Sock(mock_raw, byte_order='big')
+    mock_sock = _Sock(mock_raw, byte_order='big', p6=0.05)
     ep._socks[ecu] = mock_sock
     ep._current = ecu
     ep._server = MagicMock()
@@ -123,14 +123,6 @@ def test_mutual_exclusion():
 # 2. 对话暂停期间其他操作不被阻塞
 # ============================================================
 
-@pytest.mark.xfail(
-    reason=(
-        "已知限制：当前单一 RLock 设计，conversation() 持有锁跨 yield，"
-        "select()/connections()/current 在另一个线程调用会阻塞直到对话结束。"
-        "若后续拆分 state_lock 与 session_lock，此用例应改为 pass。"
-    ),
-    strict=True,
-)
 def test_select_not_blocked_during_conversation():
     """对话暂停（yield 后），另一线程 select() 应在 0.5s 内完成。"""
     ep = _make_endpoint()
@@ -186,77 +178,6 @@ def test_select_not_blocked_during_conversation():
         f"select() 耗时 {b_time[0]:.2f}s，应 <0.3s"
 
 
-# ============================================================
-# 3. 对话中调用 stop() 的安全性
-# ============================================================
-
-@pytest.mark.xfail(
-    reason=(
-        "已知限制：stop() 需要获取 self._lock，而 conversation 生成器持有该锁跨 yield，"
-        "从另一线程调用 stop() 会阻塞直到对话结束。"
-        "若后续拆分锁，此用例应改为 pass。"
-    ),
-    strict=True,
-)
-def test_stop_during_conversation():
-    """对话暂停时 stop() 能正常返回，之后生成器 next() 抛异常，无死锁。"""
-    ep = _make_endpoint()
-    sock = ep._socks[ECU]
-
-    recv_done = threading.Event()
-    sock.send = MagicMock()
-    sock.recv = MagicMock(side_effect=_make_recv([
-        _resp_frame(b'\x62'),
-        recv_done,
-    ]))
-
-    a_got_first = threading.Event()
-    a_error: list[BaseException | None] = [None]
-
-    def thread_a():
-        gen = ep.conversation(b'\x22')
-        first = next(gen)
-        assert first == b'\x62'
-        a_got_first.set()
-        try:
-            next(gen)
-        except Exception as e:
-            a_error[0] = e
-
-    ta = threading.Thread(target=thread_a, name='A')
-    ta.start()
-    assert a_got_first.wait(timeout=3)
-
-    # 线程 B：stop —— 期望 1s 内返回
-    b_done = threading.Event()
-    b_error: list[BaseException | None] = [None]
-
-    def thread_b():
-        try:
-            ep.stop()
-        except Exception as e:
-            b_error[0] = e
-        finally:
-            b_done.set()
-
-    tb = threading.Thread(target=thread_b, name='B')
-    tb.start()
-    tb.join(timeout=1)
-
-    # 在放行 recv 之前检查 —— stop 此时应已完成（不阻塞）
-    # 当前单锁设计下 stop() 会阻塞，此断言预期失败 → xfail
-    assert b_done.is_set(), "stop() 被阻塞超过 1s（死锁或锁粒度过粗）"
-
-    # 清理
-    recv_done.set()
-    ta.join(timeout=5)
-
-    assert b_error[0] is None, f"stop() 抛异常: {b_error[0]}"
-
-
-# ============================================================
-# 4. 高频率状态切换与对话交替
-# ============================================================
 
 def test_high_frequency_alternation():
     """多线程反复执行 select/connections/current/conversation，无异常。"""
@@ -429,7 +350,7 @@ def test_concurrency_stress():
     )
     endpoint.start()
     if not endpoint.select(0x1001):
-        endpoint.stop()
+        # endpoint.stop() removed — no longer exists
         pytest.fail("ECU 0x1001 未连接")
 
     errors: list[str] = []
@@ -471,7 +392,7 @@ def test_concurrency_stress():
     for t in threads:
         t.join()
 
-    endpoint.stop()
+    # endpoint.stop() removed — no longer exists
 
     elapsed = time.perf_counter() - start_time
     total_calls = LOOPS_PER_THREAD * len(threads)
