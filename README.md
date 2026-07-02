@@ -7,7 +7,8 @@
 ## 特性
 
 - 完全符合 ISO 13400 帧格式（版本反码、Payload Type、地址校验）
-- 自动连接管理、空闲超时与单次自动重连
+- 自动连接管理、空闲超时与断连自动重连
+- 重连成功后抛出 `ReconnectionError`，由上层决定是否重发（适配有状态诊断会话）
 - 支持多帧响应迭代（例如 0x7F … 0x78 延迟指示）
 - 线程安全的状态切换与收发
 - 零外部依赖，仅使用 Python 标准库
@@ -37,13 +38,24 @@ endpoint = Endpoint(
 endpoint.start()  # 开始接受 ECU 连接
 
 # 查看连接状态
-print(endpoint.connections())
+print(endpoint.connections)
 # {0x1301: ('192.168.10.10', 0, True), 0x1302: ('192.168.10.20', 13400, False)}
 
 # 切换到已连接的 ECU 并发送诊断请求
 endpoint.select(0x1301)
 for resp in endpoint.conversation(bytes.fromhex("22FF00")):
     print(resp.hex(" "))
+
+# 处理断连重连（适用于有状态诊断会话）
+from autodoip import ReconnectionError
+
+try:
+    for resp in endpoint.conversation(bytes.fromhex("22FF00")):
+        print(resp.hex(" "))
+except ReconnectionError:
+    # 连接已恢复，但 ECU 状态已重置（会话、安全访问等）
+    # 上层需重新同步状态后重试
+    pass
 ```
 
 ## 命令行工具
@@ -61,16 +73,17 @@ python -m autodoip \
 
 ## API 概览
 
-| 类/函数                                                         | 说明                                   |
-|--------------------------------------------------------------|--------------------------------------|
-| `Endpoint(ip, ecus, port=13400, tester=0x0E80, config=None)` | DoIP 端点，`ip` 与 `ecus` 必填             |
-| `Endpoint.start()`                                           | 启动监听，幂等；需重启则新建实例                     |
-| `Endpoint.select(addr) -> bool`                              | 切换当前 ECU；未连接或操作冲突时返回 `False` 且不改变选中  |
-| `Endpoint.conversation(payload) -> Iterator[bytes]`          | 发送 UDS 载荷，返回响应迭代器。连接中断自动重连一次         |
-| `Endpoint.current -> int \| None`                            | 当前选中的 ECU 逻辑地址                       |
-| `Endpoint.connections() -> dict`                             | `{addr: (ip, port, connected), ...}` |
-| `Config(...)`                                                | 传输调优参数（见下方）                          |
-| `ProtocolError`                                              | 帧校验失败时抛出的异常                          |
+| 类/函数 | 说明 |
+|---|---|
+| `Endpoint(ip, ecus, port=13400, tester=0x0E80, config=None)` | DoIP 端点，`ip` 与 `ecus` 必填 |
+| `Endpoint.start()` | 启动监听，幂等；需重启则新建实例 |
+| `Endpoint.select(addr) -> bool` | 切换当前 ECU；未连接或操作冲突时返回 `False` 且不改变选中 |
+| `Endpoint.conversation(payload) -> Iterator[bytes]` | 发送 UDS 载荷，返回响应迭代器。断连自动重连：成功抛 `ReconnectionError`，失败抛 `ConnectionError` |
+| `Endpoint.current -> int \| None` | 当前选中的 ECU 逻辑地址 |
+| `Endpoint.connections -> dict` | `{addr: (ip, port, connected), ...}` |
+| `Config(...)` | 传输调优参数（见下方） |
+| `ProtocolError` | 帧校验失败时抛出的异常 |
+| `ReconnectionError` | 断连重连成功后抛出，继承 `ConnectionError`。上层可据此重新同步 ECU 状态后重试 |
 
 ## 配置
 
