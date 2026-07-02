@@ -158,9 +158,10 @@ def test_timeout():
 
 
 def test_reconnect():
-    """sock 为 None → 自动重连。"""
+    """sock 为 None → 自动重连成功 → ReconnectionError，上层重试成功。"""
     print("--- 4. sock=None 自动重连 ---")
-    # start 时没有 ECU 连接，_socks[ECU] 保持 None
+    from autodoip import ReconnectionError
+
     ep = Endpoint(ip=HOST, ecus={ECU: (HOST, 0)},
                   config=Config(accept_timeout=0.3, p6_timeout=0.5))
 
@@ -170,30 +171,39 @@ def test_reconnect():
     except RuntimeError:
         pass  # 预期：没有连接
 
-    # 手动设置 current（select 需要 sock 非 None，我们绕过它）
+    # 手动设置 current
     ep._current = ECU
 
-    # 连接 ECU — 它进入 server backlog
+    # 连接 ECU — 进入 server backlog
     ecu = EchoEcu()
 
-    # conversation 发现 sock=None → _reconnect → accept 到 ecu
-    gen = ep.conversation(b'\x22\xDE\xAD')
+    # 第一次：sock=None → _reconnect → 重连成功 → ReconnectionError
+    try:
+        gen = ep.conversation(b'\x22\xDE\xAD')
+        next(gen)
+        pytest.fail("应抛出 ReconnectionError")
+    except ReconnectionError:
+        print("  收到 ReconnectionError，连接已恢复")
 
-    ready = threading.Event()
+    # 验证 sock 已恢复
+    assert ep._socks[ECU] is not None, "重连后 sock 应为非 None"
+    _, _, connected = ep.connections[ECU]
+    assert connected is True, "重连后应处于已连接状态"
+
+    # 重试：sock 已恢复，正常收发
+    gen = ep.conversation(b'\x22\xDE\xAD')
     result = []
 
     def _echo():
-        ready.set()
         result.append(ecu.echo_payload())
 
     t = threading.Thread(target=_echo)
     t.start()
-    ready.wait()
 
     resp = next(gen)
     t.join()
     assert resp == b'\x22\xDE\xAD', f"不匹配: {resp.hex(' ')}"
-    print(f"  重连后收到: {resp.hex(' ')}")
+    print(f"  重试后收到: {resp.hex(' ')}")
     gen.close()
     ecu.close()
     print("  PASS\n")

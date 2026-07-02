@@ -80,41 +80,65 @@ def test_mutual_exclusion():
     ep = _make_endpoint()
     sock = ep._socks[ECU]
 
+    # 使用 Event 控制：A 拿到第一帧后阻塞，B 尝试进入，验证互斥
+    a_got_first = threading.Event()
+    b_done = threading.Event()
+    b_got_lock = threading.Event()
+
+    call_count = [0]
+
+    def controlled_recv():
+        call_count[0] += 1
+        if call_count[0] == 1:
+            # A 的第一帧：立即返回
+            return _resp_frame(b'\x62')
+        elif call_count[0] == 2:
+            # A 的后续帧：通知 A 已拿到第一帧，然后阻塞
+            a_got_first.set()
+            b_got_lock.wait(timeout=5)
+            raise TimeoutError()
+        elif call_count[0] == 3:
+            # B 的第一帧（A 已释放锁）
+            return _resp_frame(b'\x7E')
+        else:
+            raise TimeoutError()
+
     sock.send = MagicMock()
-    sock.recv = MagicMock(side_effect=_make_recv([
-        _resp_frame(b'\x62'),
-        _Raise(TimeoutError()),
-        _resp_frame(b'\x7E'),
-        _Raise(TimeoutError()),
-    ]))
+    sock.recv = MagicMock(side_effect=controlled_recv)
 
     order: list[str] = []
     results_a: list[bytes] = []
     results_b: list[bytes] = []
+    a_done = threading.Event()
 
     def thread_a():
         order.append('A-enter')
         for resp in ep.conversation(b'\x22'):
             results_a.append(resp)
         order.append('A-exit')
+        a_done.set()
 
     def thread_b():
+        # 等待 A 已经进入 conversation 并拿到第一帧
+        a_got_first.wait(timeout=5)
         order.append('B-enter')
+        b_got_lock.set()  # 通知 A 的后续帧可以超时退出了
         for resp in ep.conversation(b'\x3E'):
             results_b.append(resp)
         order.append('B-exit')
+        b_done.set()
 
     ta = threading.Thread(target=thread_a, name='A')
     tb = threading.Thread(target=thread_b, name='B')
     ta.start()
-    time.sleep(0.05)  # 确保 A 先拿到锁
+    time.sleep(0.05)
     tb.start()
 
     ta.join(timeout=5)
     tb.join(timeout=5)
 
-    assert results_a == [b'\x62']
-    assert results_b == [b'\x7E']
+    assert results_a == [b'\x62'], f"A 应只有一帧: {results_a}"
+    assert results_b == [b'\x7E'], f"B 应有一帧: {results_b}"
     assert order == ['A-enter', 'A-exit', 'B-enter', 'B-exit'], \
         f"对话交错: {order}"
 
@@ -198,7 +222,7 @@ def test_high_frequency_alternation():
                 if choice == 0:
                     ep.select(ECU)
                 elif choice == 1:
-                    ep.connections()
+                    ep.connections
                 elif choice == 2:
                     _ = ep.current
                 elif choice == 3:
@@ -223,7 +247,7 @@ def test_high_frequency_alternation():
     if errors:
         pytest.fail(f"{len(errors)} 个错误:\n" + "\n".join(errors[:10]))
 
-    conns = ep.connections()
+    conns = ep.connections
     assert conns[ECU][2] is True  # 仍然 connected
 
 
@@ -232,7 +256,9 @@ def test_high_frequency_alternation():
 # ============================================================
 
 def test_reconnect_race_with_select():
-    """send 失败触发重连时，另一线程 select 不导致状态混乱。"""
+    """send 失败触发重连成功 → ReconnectionError；另一线程 select 不导致状态混乱。"""
+    from autodoip import ReconnectionError
+
     ep = _make_endpoint()
     sock = ep._socks[ECU]
 
@@ -264,10 +290,13 @@ def test_reconnect_race_with_select():
     errors: list[str] = []
     error_lock = threading.Lock()
     select_done = threading.Event()
+    reconnected = threading.Event()
 
     def thread_a():
         try:
             _consume_one(ep, b'\x22')
+        except ReconnectionError:
+            reconnected.set()  # 预期：重连成功，抛 ReconnectionError
         except Exception as e:
             with error_lock:
                 errors.append(f"A: {e}")
@@ -293,11 +322,12 @@ def test_reconnect_race_with_select():
     if errors:
         pytest.fail(f"并发异常:\n" + "\n".join(errors))
 
+    assert reconnected.is_set(), "应收到 ReconnectionError"
     assert select_done.is_set(), "select 未完成"
 
 
 def test_recv_error_during_conversation_clears_sock():
-    """recv 断开后 sock 被清空，另一线程能观测到 disconnected 状态。"""
+    """recv 断开后触发重连失败 → ConnectionError，sock 被清空。"""
     ep = _make_endpoint()
     sock = ep._socks[ECU]
 
@@ -308,6 +338,7 @@ def test_recv_error_during_conversation_clears_sock():
     ]))
 
     a_got_first = threading.Event()
+    a_error: list[Exception] = []
 
     def thread_a():
         gen = ep.conversation(b'\x22')
@@ -316,16 +347,17 @@ def test_recv_error_during_conversation_clears_sock():
         a_got_first.set()
         try:
             next(gen)
-        except StopIteration:
-            pass
+        except ConnectionError as e:
+            a_error.append(e)
 
     ta = threading.Thread(target=thread_a, name='A')
     ta.start()
     assert a_got_first.wait(timeout=3)
     ta.join(timeout=5)
 
+    assert len(a_error) == 1, f"应收到 ConnectionError，实际 {a_error}"
     assert ep._socks[ECU] is None
-    _, _, connected = ep.connections()[ECU]
+    _, _, connected = ep.connections[ECU]
     assert connected is False
 
 

@@ -6,6 +6,8 @@
 @描述: DoIP 协议异常
 """
 
+class ReconnectionError(ConnectionError):
+    pass
 
 class ProtocolError(Exception):
     """DoIP 协议层错误 — 帧格式校验失败（版本反码、Payload Type、

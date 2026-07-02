@@ -9,6 +9,6 @@
 
 from ._transport import Endpoint
 from ._config import Config
-from ._errors import ProtocolError
+from ._errors import ProtocolError, ReconnectionError
 
-__all__ = ["Endpoint", "Config", "ProtocolError"]
+__all__ = ["Endpoint", "Config", "ProtocolError", "ReconnectionError"]

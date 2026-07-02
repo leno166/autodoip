@@ -13,7 +13,7 @@ from typing import Literal, Iterator
 import logging
 
 from ._frame import recv_frame
-from ._errors import ProtocolError
+from ._errors import ProtocolError, ReconnectionError
 from ._config import Config
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,6 @@ class _Sock:
                  p6: float):
         self._sock = sock
         self._byte_order: Literal['little', 'big'] = byte_order
-        self._p6 = p6
         self._sock.settimeout(p6)
 
     def __del__(self) -> None:
@@ -238,11 +237,13 @@ class Endpoint:
 
     def conversation(self, payload: bytes) -> Iterator[bytes]:
         """发送 UDS 载荷，返回响应 bytes。
-        通信失败（含 sock 为 None）→ _reconnect 抢救一次；
-        抢救后重发仍失败 → 清空 sock 并抛异常。
+        通信失败时自动重连：重连成功抛出 ReconnectionError 通知上层重新同步状态；
+        重连失败抛出 ConnectionError。
 
         Raises:
             RuntimeError: 另一个操作正在进行中。
+            ReconnectionError: 连接断开后重连成功，上层需重新同步状态后重试。
+            ConnectionError: 连接断开且重连失败。
         """
         if not self._session_lock.acquire(blocking=False):
             raise RuntimeError("另一个操作正在进行中，无法发送")
@@ -258,19 +259,20 @@ class Endpoint:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug('TX DoIp: %s', frame.hex(' '))
 
-            # --- send（一次，带抢救） ---
+            # --- send ---
             try:
                 sock.send(frame)
             except (ConnectionError, OSError, AttributeError) as e:
                 logger.warning('DoIp send 失败，触发重连: %s', e)
-                sock = self._reconnect(ecu)
                 try:
-                    sock.send(frame)
-                except (ConnectionError, OSError, AttributeError):
-                    with self._state_lock:
-                        self._socks[ecu] = None
-                    logger.error('重连后 send 仍失败，清空连接', exc_info=True)
-                    raise ConnectionError(f'ECU 0x{ecu:04X} 连接断开')
+                    self._reconnect(ecu)
+                except Exception:
+                    raise ConnectionError(
+                        f'ECU 0x{ecu:04X} 连接断开且重连失败'
+                    ) from e
+                raise ReconnectionError(
+                    f'ECU 0x{ecu:04X} 连接断开后已重连，请重新同步状态后重试'
+                ) from e
 
             # --- 首帧（超时 = 无响应，直接返回） ---
             deadline = time.monotonic() + self._config.p6_star_timeout
@@ -280,10 +282,16 @@ class Endpoint:
                 logger.debug('首帧无响应')
                 return
             except (ConnectionError, OSError, AttributeError) as e:
-                logger.warning('DoIp recv 失败，清空连接: %s', e)
-                with self._state_lock:
-                    self._socks[ecu] = None
-                return
+                logger.warning('DoIp recv 失败，触发重连: %s', e)
+                try:
+                    self._reconnect(ecu)
+                except Exception:
+                    raise ConnectionError(
+                        f'ECU 0x{ecu:04X} 连接断开且重连失败'
+                    ) from e
+                raise ReconnectionError(
+                    f'ECU 0x{ecu:04X} 连接断开后已重连，请重新同步状态后重试'
+                ) from e
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug('RX DoIp: %s', response.hex(' '))
@@ -296,10 +304,16 @@ class Endpoint:
                 except TimeoutError:
                     continue
                 except (ConnectionError, OSError, AttributeError) as e:
-                    logger.warning('DoIp recv 失败，清空连接: %s', e)
-                    with self._state_lock:
-                        self._socks[ecu] = None
-                    return
+                    logger.warning('DoIp recv 失败，触发重连: %s', e)
+                    try:
+                        self._reconnect(ecu)
+                    except Exception:
+                        raise ConnectionError(
+                            f'ECU 0x{ecu:04X} 连接断开且重连失败'
+                        ) from e
+                    raise ReconnectionError(
+                        f'ECU 0x{ecu:04X} 连接断开后已重连，请重新同步状态后重试'
+                    ) from e
 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug('RX DoIp: %s', response.hex(' '))
