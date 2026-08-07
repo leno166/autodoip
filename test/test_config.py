@@ -53,7 +53,8 @@ class TestEndpointWithConfig:
         ep = Endpoint(ip='0.0.0.0', ecus={}, config=cfg)
         assert ep._config is cfg
         assert not hasattr(ep, '_accept_timeout')
-        assert not hasattr(ep, '_recv_timeout')
+        assert not hasattr(ep, '_p6_timeout')
+        assert not hasattr(ep, '_p6_star_timeout')
         assert not hasattr(ep, '_listen_count')
 
     def test_tester_in_endpoint_not_in_config(self):
