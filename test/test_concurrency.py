@@ -78,6 +78,7 @@ def _consume_one(ep: Endpoint, payload: bytes) -> bytes:
 def test_mutual_exclusion():
     """两个线程同时 conversation()，第二条必须等第一条完成，响应不交错。"""
     ep = _make_endpoint()
+    ep._config.p6_star_timeout = 0.01  # 极短 deadline，让 while 循环快速退出
     sock = ep._socks[ECU]
 
     # 使用 Event 控制：A 拿到第一帧后阻塞，B 尝试进入，验证互斥
@@ -92,15 +93,10 @@ def test_mutual_exclusion():
         if call_count[0] == 1:
             # A 的第一帧：立即返回
             return _resp_frame(b'\x62')
-        elif call_count[0] == 2:
-            # A 的后续帧：通知 A 已拿到第一帧，然后阻塞
+        else:
+            # A 的后续帧：通知已拿到第一帧，等 B 就绪后超时，deadline 过期退出
             a_got_first.set()
             b_got_lock.wait(timeout=5)
-            raise TimeoutError()
-        elif call_count[0] == 3:
-            # B 的第一帧（A 已释放锁）
-            return _resp_frame(b'\x7E')
-        else:
             raise TimeoutError()
 
     sock.send = MagicMock()
@@ -121,8 +117,20 @@ def test_mutual_exclusion():
     def thread_b():
         # 等待 A 已经进入 conversation 并拿到第一帧
         a_got_first.wait(timeout=5)
-        order.append('B-enter')
         b_got_lock.set()  # 通知 A 的后续帧可以超时退出了
+        # 等待 A 完成清理、释放锁
+        a_done.wait(timeout=5)
+        # 替换 recv，B 拿到一帧后全返回 TimeoutError（while 循环直到 deadline 退出）
+        b_call_count = [0]
+
+        def b_recv():
+            b_call_count[0] += 1
+            if b_call_count[0] == 1:
+                return _resp_frame(b'\x7E')
+            raise TimeoutError()
+
+        sock.recv = MagicMock(side_effect=b_recv)
+        order.append('B-enter')
         for resp in ep.conversation(b'\x3E'):
             results_b.append(resp)
         order.append('B-exit')
