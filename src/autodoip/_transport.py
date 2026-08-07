@@ -179,6 +179,23 @@ class Endpoint:
 
     # --- 生命周期 ---
 
+    def close(self) -> None:
+        """关闭所有连接和监听 socket，释放端口。"""
+        with self._state_lock:
+            for addr, sock in self._socks.items():
+                if sock is not None:
+                    try:
+                        sock._sock.close()
+                    except OSError:
+                        pass
+                    self._socks[addr] = None
+            if self._server is not None:
+                try:
+                    self._server.close()
+                except OSError:
+                    pass
+                self._server = None
+
     def start(self) -> None:
         """启动 DoIp 监听，accept 等待 ECU 连接。幂等，重复调用无副作用。
 
