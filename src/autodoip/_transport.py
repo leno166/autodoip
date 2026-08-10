@@ -419,3 +419,50 @@ class Endpoint:
             if self._socks[addr] is None:
                 raise TimeoutError(f"ECU 0x{addr:04X} 重连超时")
             return self._socks[addr]
+
+    def reconnect(self, timeout: float = 3.0) -> bool:
+        """重新等待当前 ECU 建立连接，最多尝试 timeout 秒。
+
+        用于上层已知连接即将重建的场景 —— 某些操作会让对端重启通信栈并断链，
+        不必等到下一次发送失败才被动重连。
+
+        对端检测断开、重新发起 TCP 都需要时间，单次 accept 窗口往往等不到，
+        所以这里在 timeout 内反复调 _accept4connect：它没等到连接时抛
+        TimeoutError / RuntimeError，都当作「还没来，继续等」；其余异常照常抛出。
+
+        返回目标 ECU 是否已连上。本方法对协议内容中立 —— 不解析载荷，只管连接。
+        """
+        if not self._session_lock.acquire(blocking=False):
+            return False
+        try:
+            with self._state_lock:
+                target = self._current
+                if target is None:
+                    raise ProtocolError('DoIp: 没有设置 ecu 逻辑地址')
+                if self._server is None:
+                    raise RuntimeError('服务未启动')
+                stale = self._socks[target]
+                self._socks[target] = None
+
+            if stale is not None:
+                try:
+                    stale._sock.close()
+                except OSError:
+                    pass
+
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    self._accept4connect()
+                except (TimeoutError, RuntimeError) as e:
+                    logger.debug('等待 ECU 0x%04X 重连: %s', target, e)
+
+                with self._state_lock:
+                    if self._socks[target] is not None:
+                        return True
+
+                if time.monotonic() >= deadline:
+                    logger.warning('ECU 0x%04X 未在 %.1fs 内重连', target, timeout)
+                    return False
+        finally:
+            self._session_lock.release()
